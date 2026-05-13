@@ -28,6 +28,13 @@ Web app with elegant dark UX/UI displaying real-time NASDAQ/NYSE quotes (INTC, S
 - Add Stock dialog with quick suggestions.
 - Defaults seeded on first load.
 
+### Iteration 2 (P1 + Smart enhancement)
+- **Sparkline 30d** on every card (closes returned inside `/api/quotes`, rendered with recharts).
+- **Prediction caching**: `POST /api/predict/{ticker}` reuses any prediction from the last hour; `?force=true` bypasses cache. Cached response served in ~20ms.
+- **Compare endpoint** `/api/compare?tickers=A,B[,C,D]` returns 30-day series normalized to base 100. Frontend Compare sheet overlays up to 4 tickers with legend + per-ticker change %.
+- **Top Movers shareable PNG**: dialog renders top 3 gainers / top 3 losers with USD + MXN; one-click download via `html-to-image`; Web Share API fallback for mobile.
+- 15/15 backend regression tests pass.
+
 ## Backlog (P1)
 - Sparkline chart on each card (recharts).
 - Push notifications when prediction direction flips.
