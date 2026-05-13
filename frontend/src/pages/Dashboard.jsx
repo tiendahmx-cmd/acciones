@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState, useCallback } from "react";
-import { TrendUp, TrendDown, Plus, ArrowsClockwise, ChartLineUp, CurrencyDollar } from "@phosphor-icons/react";
+import { TrendUp, TrendDown, Plus, ArrowsClockwise, ChartLineUp, CurrencyDollar, Scales, Share } from "@phosphor-icons/react";
 import { toast } from "sonner";
 import { api } from "../lib/api";
 import StockCard from "../components/StockCard";
 import AddStockDialog from "../components/AddStockDialog";
 import StockDetailSheet from "../components/StockDetailSheet";
+import CompareSheet from "../components/CompareSheet";
+import TopMoversDialog from "../components/TopMoversDialog";
 import { Button } from "../components/ui/button";
 
 export default function Dashboard() {
@@ -13,6 +15,8 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  const [compareOpen, setCompareOpen] = useState(false);
+  const [moversOpen, setMoversOpen] = useState(false);
   const [selectedTicker, setSelectedTicker] = useState(null);
   const [fetchedAt, setFetchedAt] = useState(null);
 
@@ -95,6 +99,28 @@ export default function Dashboard() {
                 {mxnRate ? mxnRate.toFixed(4) : "—"}
               </span>
             </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setMoversOpen(true)}
+              disabled={quotes.length === 0}
+              data-testid="top-movers-btn"
+              className="border-line bg-obsidian-surface hover:bg-obsidian-hover hover:text-ink-primary text-ink-secondary"
+            >
+              <Share size={16} weight="bold" />
+              <span className="hidden sm:inline ml-2">Top Movers</span>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setCompareOpen(true)}
+              disabled={quotes.length < 2}
+              data-testid="compare-btn"
+              className="border-line bg-obsidian-surface hover:bg-obsidian-hover hover:text-ink-primary text-ink-secondary"
+            >
+              <Scales size={16} weight="bold" />
+              <span className="hidden sm:inline ml-2">Comparar</span>
+            </Button>
             <Button
               variant="outline"
               size="sm"
@@ -185,6 +211,18 @@ export default function Dashboard() {
       </main>
 
       <AddStockDialog open={addOpen} onOpenChange={setAddOpen} onAdd={handleAdd} />
+      <CompareSheet
+        open={compareOpen}
+        onClose={() => setCompareOpen(false)}
+        tickers={quotes.map((q) => q.ticker)}
+        available={quotes.map((q) => q.ticker)}
+      />
+      <TopMoversDialog
+        open={moversOpen}
+        onOpenChange={setMoversOpen}
+        quotes={quotes}
+        mxnRate={mxnRate}
+      />
       <StockDetailSheet
         ticker={selectedTicker}
         open={!!selectedTicker}

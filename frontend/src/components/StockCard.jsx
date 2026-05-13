@@ -1,5 +1,6 @@
 import { TrendUp, TrendDown, X } from "@phosphor-icons/react";
 import { fmtUSD, fmtMXN, fmtPct, fmtNumber } from "../lib/api";
+import Sparkline from "./Sparkline";
 
 export default function StockCard({ quote, onSelect, onRemove }) {
   const isUp = (quote.change_percent ?? 0) >= 0;
@@ -56,8 +57,13 @@ export default function StockCard({ quote, onSelect, onRemove }) {
         </p>
       </div>
 
+      {/* Sparkline 30d */}
+      <div className="mt-3 -mx-1" data-testid={`sparkline-${quote.ticker}`}>
+        <Sparkline data={quote.sparkline || []} isUp={isUp} height={40} />
+      </div>
+
       {/* OHL row */}
-      <div className="mt-5 pt-4 border-t border-line grid grid-cols-3 gap-2">
+      <div className="mt-3 pt-4 border-t border-line grid grid-cols-3 gap-2">
         <Stat label="Apertura" value={fmtNumber(quote.open)} />
         <Stat label="Máximo" value={fmtNumber(quote.high)} />
         <Stat label="Mínimo" value={fmtNumber(quote.low)} />

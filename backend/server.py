@@ -56,6 +56,7 @@ class StockQuote(BaseModel):
     volume: Optional[int] = None
     price_mxn: Optional[float] = None
     exchange: Optional[str] = None
+    sparkline: List[float] = []
 
 
 class PredictionResponse(BaseModel):
@@ -122,9 +123,10 @@ def _fetch_quote_sync(ticker: str) -> dict:
     except Exception:
         info = {}
 
-    hist = t.history(period="2d", interval="1d", auto_adjust=False)
+    hist = t.history(period="1mo", interval="1d", auto_adjust=False)
     price = open_p = high = low = prev_close = None
     volume = None
+    sparkline: List[float] = []
     if hist is not None and not hist.empty:
         last = hist.iloc[-1]
         price = float(last["Close"])
@@ -136,6 +138,7 @@ def _fetch_quote_sync(ticker: str) -> dict:
             prev_close = float(hist.iloc[-2]["Close"])
         else:
             prev_close = float(info.get("previous_close") or info.get("previousClose") or open_p)
+        sparkline = [round(float(v), 2) for v in hist["Close"].tolist()]
 
     if price is None:
         # fallback to fast_info
@@ -173,6 +176,7 @@ def _fetch_quote_sync(ticker: str) -> dict:
         "previous_close": prev_close,
         "volume": volume,
         "exchange": exchange,
+        "sparkline": sparkline,
     }
 
 
@@ -301,8 +305,21 @@ async def history(ticker: str):
 
 
 @api_router.post("/predict/{ticker}")
-async def predict(ticker: str):
+async def predict(ticker: str, force: bool = False):
     ticker = ticker.upper()
+
+    # Cache: reuse prediction generated within the last hour unless force=True
+    if not force:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        cached = await db.predictions.find_one(
+            {"ticker": ticker, "generated_at": {"$gte": cutoff}},
+            {"_id": 0, "_pkey": 0},
+            sort=[("generated_at", -1)],
+        )
+        if cached:
+            cached["cached"] = True
+            return cached
+
     mxn_rate = await get_usd_mxn_rate()
     quote = await fetch_quote(ticker, mxn_rate)
     history_rows = await asyncio.to_thread(_fetch_history_sync, ticker)
@@ -378,7 +395,50 @@ async def predict(ticker: str):
     doc = result.model_dump()
     doc["generated_at"] = doc["generated_at"].isoformat()
     await db.predictions.insert_one({**doc, "_pkey": f"{ticker}-{doc['generated_at']}"})
-    return result.model_dump()
+    doc["cached"] = False
+    return doc
+
+
+@api_router.get("/compare")
+async def compare(tickers: str):
+    """Compare 2+ tickers' 30d normalized close (base 100)."""
+    ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if len(ticker_list) < 2:
+        raise HTTPException(status_code=400, detail="Provide at least 2 tickers")
+    if len(ticker_list) > 4:
+        raise HTTPException(status_code=400, detail="Maximum 4 tickers")
+
+    async def fetch(t):
+        try:
+            return t, await asyncio.to_thread(_fetch_history_sync, t)
+        except Exception as e:
+            logger.warning(f"compare fetch {t}: {e}")
+            return t, []
+
+    results = await asyncio.gather(*[fetch(t) for t in ticker_list])
+
+    series = []
+    for t, rows in results:
+        if not rows:
+            continue
+        base = rows[0]["close"] or 1.0
+        points = [
+            {"date": r["date"], "value": round((r["close"] / base) * 100, 2), "raw": r["close"]}
+            for r in rows
+        ]
+        change_pct = ((rows[-1]["close"] - rows[0]["close"]) / rows[0]["close"]) * 100 if rows[0]["close"] else 0
+        series.append({
+            "ticker": t,
+            "points": points,
+            "start": rows[0]["close"],
+            "end": rows[-1]["close"],
+            "change_percent": round(change_pct, 2),
+        })
+
+    if not series:
+        raise HTTPException(status_code=404, detail="No data for provided tickers")
+
+    return {"series": series, "tickers": [s["ticker"] for s in series]}
 
 
 app.include_router(api_router)
