@@ -1,0 +1,111 @@
+{
+  "theme": "Dark",
+  "archetype": "Archetype 4: Swiss & High-Contrast (Adapted for Dark Mode Control Room)",
+  "typography": {
+    "headings": {
+      "family": "Manrope",
+      "weights": "font-medium to font-semibold",
+      "description": "Used for page titles, modal headers, and main metrics.",
+      "letter_spacing": "tracking-tight",
+      "fallback": "ui-sans-serif, system-ui, sans-serif"
+    },
+    "body": {
+      "family": "IBM Plex Sans",
+      "weights": "font-normal",
+      "description": "Used for standard text, labels, and descriptions.",
+      "fallback": "ui-sans-serif, system-ui, sans-serif"
+    },
+    "numbers_and_tickers": {
+      "family": "JetBrains Mono",
+      "weights": "font-medium to font-bold",
+      "description": "MANDATORY for all stock prices, tickers (INTC, AAPL), percentages, and financial data to ensure tabular alignment and a technical feel.",
+      "fallback": "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+    }
+  },
+  "colors": {
+    "background": {
+      "default": "#06080A",
+      "description": "Deepest obsidian, tinted with a hint of cool blue. Never pure black."
+    },
+    "surface": {
+      "card": "#0E1116",
+      "card_hover": "#151921",
+      "sheet": "#0A0D12",
+      "description": "Subtle elevation using slightly lighter tints of the background."
+    },
+    "border": {
+      "default": "#1E232B",
+      "focus": "#333C4A",
+      "description": "Grid Borders ('The Technical Look'). 1px subtle strokes to separate components without relying on soft shadows."
+    },
+    "text": {
+      "primary": "#F8FAFC",
+      "secondary": "#94A3B8",
+      "muted": "#475569"
+    },
+    "accents": {
+      "positive": {
+        "text": "#10B981",
+        "bg": "rgba(16, 185, 129, 0.1)",
+        "border": "rgba(16, 185, 129, 0.3)",
+        "description": "Emerald green for gains."
+      },
+      "negative": {
+        "text": "#EF4444",
+        "bg": "rgba(239, 68, 68, 0.1)",
+        "border": "rgba(239, 68, 68, 0.3)",
+        "description": "Ruby red for losses."
+      },
+      "brand": {
+        "default": "#3B82F6",
+        "hover": "#60A5FA",
+        "description": "Electric blue for primary actions (buttons, toggles)."
+      }
+    }
+  },
+  "layout_and_spacing": {
+    "strategy": "The 'Control Room' Grid (Mode B)",
+    "container": "max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-8 py-8",
+    "dashboard_grid": "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 md:gap-6",
+    "card_padding": "p-5 md:p-6",
+    "alignment": "Numbers and monetary values right-aligned or strictly structured. Tickers and labels left-aligned. Clear optical alignment."
+  },
+  "components": {
+    "cards": {
+      "style": "Flat background, 1px border-border, no shadow. Hover: border darkens, slight lift (-translate-y-1).",
+      "radius": "rounded-xl"
+    },
+    "side_panel_sheet": {
+      "style": "Dark solid background, 1px left border. Header area has glassmorphism if overlapping an abstract image.",
+      "ai_prediction_section": "Highlight this section with a subtle neon glow or a distinct border to differentiate AI content from raw data."
+    },
+    "buttons": {
+      "primary": "Solid brand color, sharp or slightly rounded corners, high contrast text.",
+      "secondary": "Transparent background, 1px border, text-secondary hover to text-primary."
+    },
+    "inputs_and_search": {
+      "style": "Dark background input (#0E1116), subtle border, high contrast white text. Focus ring should be brand accent."
+    }
+  },
+  "interactions_and_motion": {
+    "hover": "All interactive elements MUST have explicitly defined hover states. E.g., hover:bg-[#151921] hover:text-white transition-all duration-200.",
+    "cards": "Subtle border color change on hover, no extreme scaling.",
+    "data_refresh": "Animate numbers briefly (e.g., flash green/red) when data updates."
+  },
+  "image_urls": {
+    "ai_prediction_bg": {
+      "url": "https://images.unsplash.com/photo-1775057154553-0f3e8902fea3?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA3MDR8MHwxfHNlYXJjaHwxfHxkYXJrJTIwZGF0YSUyMG5ldHdvcmslMjBiYWNrZ3JvdW5kfGVufDB8fHx8MTc3ODY5ODk2N3ww&ixlib=rb-4.1.0&q=85",
+      "description": "Abstract data network geometry. Use as a low-opacity (10-20%) background in the Side Panel header or behind the AI prediction cards."
+    }
+  },
+  "instructions_to_main_agent": [
+    "CRITICAL: Apply 'data-testid' to all interactive elements (e.g., stock-card-{ticker}, add-stock-btn, refresh-btn, side-panel-close).",
+    "Implement the layout using a strict 'Control Room' grid layout for the stock cards. No empty spaces.",
+    "Install and use Phosphor Icons via 'yarn add @phosphor-icons/react' for clean, high-end technical iconography.",
+    "Load Google Fonts: 'Manrope' (headings), 'IBM Plex Sans' (body), 'JetBrains Mono' (tickers/prices) via standard import.",
+    "In the stock card, clearly differentiate USD and MXN prices using size and color hierarchy (USD primary/large, MXN secondary/muted).",
+    "The Side Panel must clearly feature 'AI Prediction' with an elevated/premium design feel, using the provided image_url as a background overlay.",
+    "Never use pure black or pure white. Follow the provided color hex codes strictly.",
+    "Customize tailwind.config.js to include these exact colors and fonts."
+  ]
+}
