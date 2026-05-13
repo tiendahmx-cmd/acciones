@@ -7,6 +7,7 @@ import AddStockDialog from "../components/AddStockDialog";
 import StockDetailSheet from "../components/StockDetailSheet";
 import CompareSheet from "../components/CompareSheet";
 import TopMoversDialog from "../components/TopMoversDialog";
+import AlertsBell from "../components/AlertsBell";
 import { Button } from "../components/ui/button";
 
 export default function Dashboard() {
@@ -37,6 +38,8 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadQuotes();
+    // Fire-and-forget: trigger backend price-move alert check on load
+    api.post("/alerts/sync").catch(() => {});
     const id = setInterval(() => loadQuotes(true), 60000);
     return () => clearInterval(id);
   }, [loadQuotes]);
@@ -99,6 +102,7 @@ export default function Dashboard() {
                 {mxnRate ? mxnRate.toFixed(4) : "—"}
               </span>
             </div>
+            <AlertsBell onAlertClick={(t) => setSelectedTicker(t)} />
             <Button
               variant="outline"
               size="sm"

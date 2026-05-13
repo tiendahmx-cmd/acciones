@@ -7,6 +7,7 @@ import logging
 import asyncio
 import json
 import re
+import uuid
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -394,7 +395,28 @@ async def predict(ticker: str, force: bool = False):
     )
     doc = result.model_dump()
     doc["generated_at"] = doc["generated_at"].isoformat()
+
+    # Check for direction flip vs the previous stored prediction
+    prev = await db.predictions.find_one(
+        {"ticker": ticker},
+        {"_id": 0, "direction": 1, "generated_at": 1, "prediction_price": 1},
+        sort=[("generated_at", -1)],
+    )
     await db.predictions.insert_one({**doc, "_pkey": f"{ticker}-{doc['generated_at']}"})
+
+    if prev and prev.get("direction") and prev["direction"] != result.direction and result.direction in ("up", "down") and prev["direction"] in ("up", "down"):
+        await _create_alert(
+            ticker=ticker,
+            atype="direction_flip",
+            message=f"AI direction flipped {prev['direction'].upper()} → {result.direction.upper()} ({result.confidence} confidence)",
+            payload={
+                "from_direction": prev["direction"],
+                "to_direction": result.direction,
+                "prediction_price": result.prediction_price,
+                "confidence": result.confidence,
+            },
+        )
+
     doc["cached"] = False
     return doc
 
@@ -439,6 +461,117 @@ async def compare(tickers: str):
         raise HTTPException(status_code=404, detail="No data for provided tickers")
 
     return {"series": series, "tickers": [s["ticker"] for s in series]}
+
+
+# ---------- Alerts ----------
+PRICE_MOVE_THRESHOLD = 3.0  # percent
+
+
+async def _create_alert(ticker: str, atype: str, message: str, payload: dict | None = None) -> dict:
+    doc = {
+        "id": str(uuid.uuid4()),
+        "ticker": ticker.upper(),
+        "type": atype,
+        "message": message,
+        "payload": payload or {},
+        "read": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.alerts.insert_one(doc)
+    return {k: v for k, v in doc.items() if k != "_id"}
+
+
+async def _check_price_moves(threshold: float = PRICE_MOVE_THRESHOLD) -> int:
+    """Compare each watchlist ticker against last stored ticker_state price; alert if abs(move) >= threshold."""
+    items = await db.watchlist.find({}, {"_id": 0}).to_list(500)
+    tickers = [it["ticker"] for it in items]
+    if not tickers:
+        return 0
+    mxn_rate = await get_usd_mxn_rate()
+    created = 0
+    for t in tickers:
+        try:
+            q = await fetch_quote(t, mxn_rate)
+        except Exception as e:
+            logger.warning(f"price-check fetch {t}: {e}")
+            continue
+        state = await db.ticker_state.find_one({"ticker": t}, {"_id": 0})
+        prev_price = state.get("last_price") if state else None
+        if prev_price and q.price:
+            move = ((q.price - prev_price) / prev_price) * 100
+            if abs(move) >= threshold:
+                direction = "up" if move > 0 else "down"
+                await _create_alert(
+                    ticker=t,
+                    atype="price_move",
+                    message=f"{t} {direction} {move:+.2f}% to ${q.price:.2f}",
+                    payload={
+                        "from_price": prev_price,
+                        "to_price": q.price,
+                        "change_percent": round(move, 2),
+                        "direction": direction,
+                    },
+                )
+                created += 1
+        await db.ticker_state.update_one(
+            {"ticker": t},
+            {"$set": {"last_price": q.price, "updated_at": datetime.now(timezone.utc).isoformat()}},
+            upsert=True,
+        )
+    return created
+
+
+@api_router.get("/alerts")
+async def list_alerts(unread_only: bool = False, limit: int = 50):
+    query = {"read": False} if unread_only else {}
+    items = await db.alerts.find(query, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    unread = await db.alerts.count_documents({"read": False})
+    return {"alerts": items, "unread": unread, "total": await db.alerts.count_documents({})}
+
+
+@api_router.post("/alerts/sync")
+async def sync_alerts():
+    created = await _check_price_moves()
+    return {"created": created}
+
+
+@api_router.post("/alerts/{alert_id}/read")
+async def mark_alert_read(alert_id: str):
+    res = await db.alerts.update_one({"id": alert_id}, {"$set": {"read": True}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"id": alert_id, "read": True}
+
+
+@api_router.post("/alerts/read-all")
+async def mark_all_read():
+    res = await db.alerts.update_many({"read": False}, {"$set": {"read": True}})
+    return {"updated": res.modified_count}
+
+
+@api_router.delete("/alerts")
+async def clear_alerts():
+    res = await db.alerts.delete_many({})
+    return {"deleted": res.deleted_count}
+
+
+# ---------- Background scheduler ----------
+async def _alerts_loop():
+    # initial delay to let app boot
+    await asyncio.sleep(15)
+    while True:
+        try:
+            n = await _check_price_moves()
+            if n:
+                logger.info(f"alerts_loop: {n} new alerts")
+        except Exception as e:
+            logger.error(f"alerts_loop iteration failed: {e}")
+        await asyncio.sleep(600)  # 10 minutes
+
+
+@app.on_event("startup")
+async def _on_startup():
+    asyncio.create_task(_alerts_loop())
 
 
 app.include_router(api_router)

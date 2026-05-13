@@ -1,0 +1,39 @@
+{
+  "summary": "Iteration 3 backend testing for P2 Alerts feature (price_move + direction_flip). Wrote 13 new pytest cases in /app/backend/tests/test_alerts.py plus re-ran 15 regression tests from backend_test.py. ALL 28 TESTS PASSED. Used pymongo to directly seed ticker_state (with last_price ~30% off current) to force deterministic price_move alert creation, and seeded a previous prediction with direction='down' to trigger direction_flip on a fresh /api/predict/QCOM?force=true call. Validated full alert document schema (id/ticker/type/message/payload/read/created_at), _id never leaked, proper 404 for unknown alert id, read-all updates count, DELETE clears collection, and all prior endpoints (/api/quotes, /api/predict cache+force, /api/compare, /api/watchlist, /api/exchange-rate) still work. Final teardown drops alerts + ticker_state collections to leave clean state.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "startup", "issue": "@app.on_event('startup') is deprecated in FastAPI 0.110+; recommend migrating _alerts_loop registration to the lifespan context manager. Functionally works today."},
+      {"endpoint": "_alerts_loop", "issue": "Loop only logs when alerts are created (if n:). No heartbeat log makes it hard to verify task is running without waiting 10+ minutes. Consider DEBUG-level heartbeat."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_alerts.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/iter3_alerts.xml",
+    "/app/test_reports/pytest/iter3_regression.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "FastAPI on_event('startup') is deprecated — migrate to lifespan handler so _alerts_loop survives future FastAPI upgrades.",
+    "_alerts_loop has no observability — add a heartbeat log (e.g., DEBUG every iteration) so SRE can confirm it's alive without waiting for an alert.",
+    "_create_alert returns the doc but callers ignore it — either drop the return or use it (minor).",
+    "PRICE_MOVE_THRESHOLD hard-coded; consider moving to env var for tunability.",
+    "No index on alerts.created_at — at scale the sort+limit will tablescan; add a Mongo index."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_alerts.py (new)"
+  ],
+  "success_rate": {"backend": "100% (28/28)", "frontend": "N/A (backend-only request)"},
+  "test_credentials": "N/A",
+  "seed_data_creation": "Tests temporarily seed ticker_state (last_price = 70% of current for NVDA), seed a previous prediction for QCOM (direction='down'), and insert sample alert docs. All cleaned up by test_zz_final_cleanup which drops alerts + ticker_state collections and removes seed predictions (_pkey ending in -seed). Watchlist 12 defaults left intact.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Alerts feature fully validated. test_alerts.py uses pymongo to directly seed Mongo state (MONGO_URL + DB_NAME read from /app/backend/.env) to deterministically trigger price_move (set ticker_state.last_price ~30% off current) and direction_flip (insert prediction with opposite direction then force re-predict). Final cleanup test (test_zz prefix to ensure last execution under alphabetical default ordering) drops alerts + ticker_state collections — DO NOT remove this. Background asyncio _alerts_loop is registered via deprecated on_event('startup'); functionally proven by the fact that POST /api/alerts/sync (which calls the same _check_price_moves) works. No need to wait 10 minutes to verify the loop.",
+  "rca of the issue": "N/A — no bugs found in P2 Alerts feature."
+}
