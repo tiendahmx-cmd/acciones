@@ -35,6 +35,14 @@ Web app with elegant dark UX/UI displaying real-time NASDAQ/NYSE quotes (INTC, S
 - **Top Movers shareable PNG**: dialog renders top 3 gainers / top 3 losers with USD + MXN; one-click download via `html-to-image`; Web Share API fallback for mobile.
 - 15/15 backend regression tests pass.
 
+### Iteration 3 (P2 — Alerts)
+- New collections `alerts`, `ticker_state`.
+- **Price-move alerts**: background asyncio task every 10 min + `POST /api/alerts/sync` on dashboard load; emits alert when any watchlist ticker moves ≥ 3% vs last-known price.
+- **AI direction-flip alerts**: emitted automatically inside `/api/predict` when the latest prediction's direction differs from the previously stored one.
+- Endpoints: `GET /api/alerts`, `POST /api/alerts/sync`, `POST /api/alerts/{id}/read`, `POST /api/alerts/read-all`, `DELETE /api/alerts`.
+- Frontend `AlertsBell` with badge counter, popover, mark-as-read, clear-all, click-to-open-detail. Polls every 30s.
+- 28/28 backend tests pass (iter 3).
+
 ## Backlog (P1)
 - Sparkline chart on each card (recharts).
 - Push notifications when prediction direction flips.
