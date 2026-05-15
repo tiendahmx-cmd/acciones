@@ -1,0 +1,31 @@
+{
+  "summary": "Iteration 5 retest of the 3 previously failing portfolio target/stop-loss tests after main agent's fix in /api/alerts/sync (and _alerts_loop) — _check_target_crosses now runs BEFORE _check_price_moves so prev_price snapshot is intact when target detection executes. ALL 3 previously failing tests now PASS: test_target_hit_alert, test_stop_loss_hit_alert, test_target_alert_cooldown. Full regression: 52/52 PASS (24 portfolio + 12 alerts + 16 backend_test). No new failures. The order-swap fix is correct and targeted; no other side effects detected.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "PUT /api/portfolio/target/{ticker}", "issue": "Response echoes only the fields supplied; consider returning merged target doc."},
+      {"endpoint": "POST /api/portfolio/lots", "issue": "No ticker resolvability validation (unlike /api/watchlist which calls fetch_quote)."},
+      {"endpoint": "_check_target_crosses", "issue": "Function does not itself update ticker_state.last_price after firing — relies on _check_price_moves running afterwards. Current ordering (target first, price second) preserves correctness, but the implicit coupling remains fragile."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_portfolio.py",
+    "/app/test_reports/pytest/iter5_full.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Fix is minimal and correct (server.py L549-550 swap). Consider adding an inline comment explaining the ordering invariant so future refactors don't accidentally re-introduce the bug.",
+    "Better long-term refactor: merge _check_target_crosses + _check_price_moves into one per-ticker pass that explicitly captures prev_price once and uses it for both detections, eliminating the ordering dependency entirely.",
+    "Lots stored with buy_date as string (YYYY-MM-DD) — sort works lexicographically; consider datetime for robustness.",
+    "POST /api/portfolio/lots accepts any regex-valid ticker without verifying it resolves at the data provider."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (52/52 — portfolio 24/24, alerts 12/12, regression 16/16)", "frontend": "N/A (backend-only request)"},
+  "test_credentials": "N/A",
+  "seed_data_creation": "test_portfolio.py seeds position_lots, position_targets, ticker_state via pymongo. test_zz_final_cleanup drops position_lots, position_targets, alerts, ticker_state. Watchlist 12-default seed remains intact.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Iter 4 critical ordering bug is RESOLVED. /api/alerts/sync now calls _check_target_crosses before _check_price_moves; same fix applied in _alerts_loop background task. All 52 backend tests pass. If main agent makes further changes to alerts logic, re-run /app/backend/tests/test_portfolio.py — particularly test_target_hit_alert, test_stop_loss_hit_alert, test_target_alert_cooldown which directly verify the cross-detection invariant.",
+  "rca of the issue": "Fix verified: server.py /api/alerts/sync now runs _check_target_crosses first (capturing prev_price from ticker_state before _check_price_moves overwrites it), then _check_price_moves advances last_price. Same ordering applied in _alerts_loop. Tests confirm: target_hits>=1 when last_price seeded below target with current quote above; stop_loss_hits>=1 for symmetric downward cross; second consecutive sync does NOT duplicate target_hit alert (6h cooldown honored)."
+}

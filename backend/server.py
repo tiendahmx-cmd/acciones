@@ -544,8 +544,10 @@ async def list_alerts(unread_only: bool = False, limit: int = 50):
 
 @api_router.post("/alerts/sync")
 async def sync_alerts():
-    created = await _check_price_moves()
+    # IMPORTANT: target/stop-loss check MUST run before price-move check,
+    # because the latter overwrites ticker_state.last_price.
     target_created = await _check_target_crosses()
+    created = await _check_price_moves()
     return {"created": created + target_created, "price_moves": created, "target_hits": target_created}
 
 
@@ -807,8 +809,9 @@ async def _alerts_loop():
     await asyncio.sleep(15)
     while True:
         try:
-            n = await _check_price_moves()
+            # target check first — relies on the previous tick's last_price
             t = await _check_target_crosses()
+            n = await _check_price_moves()
             total = (n or 0) + (t or 0)
             if total:
                 logger.info(f"alerts_loop: {total} new alerts ({n} price, {t} target)")
