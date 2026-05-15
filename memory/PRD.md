@@ -52,6 +52,16 @@ Web app with elegant dark UX/UI displaying real-time NASDAQ/NYSE quotes (INTC, S
 - Frontend: tab toggle Watchlist/Portafolio, summary tiles (invertido / valor / P&L USD+MXN), position cards con P&L, target distance, stop-loss, ganancia proyectada al objetivo, AddLotDialog, SetTargetDialog, LotsListDialog (eliminar lotes).
 - 52/52 backend tests pass (iter 5 — fixed critical ordering bug donde `_check_price_moves` sobreescribía `last_price` antes que `_check_target_crosses` lo leyera).
 
+### Iteration 6 (Histórico de operaciones cerradas)
+- New collection `closed_trades`.
+- **POST `/api/portfolio/sell`** con selector FIFO / LIFO / SPECIFIC + ventas parciales (split de lote). Si un lote queda en 0 se elimina; si queda en parcial sólo se reduce su qty.
+- **Métricas por trade**: P&L USD+MXN, % retorno, días sostenidos (promedio ponderado), retorno anualizado, asignación de lotes consumidos.
+- **GET `/api/portfolio/trades`** con summary (count, wins, losses, win_rate, total_pnl_usd/mxn, total_return_pct).
+- **GET `/api/portfolio/trades/equity-curve`** — agregación mensual con cumulative_usd / cumulative_mxn para gráfica de equity.
+- **DELETE `/api/portfolio/trades/{id}`** — borrar del historial.
+- Frontend: tercer tab **Historial** con summary tiles, equity curve mensual (recharts AreaChart con punto mensual), tabla de trades con anualizado. Botón "Vender" en cada PositionCard abre `SellPositionDialog` con selector de método y proyección de P&L en vivo.
+- 69/69 backend tests pass (iter 6).
+
 ## Backlog (P1)
 - Sparkline chart on each card (recharts).
 - Push notifications when prediction direction flips.
