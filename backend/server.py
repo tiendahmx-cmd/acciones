@@ -71,6 +71,19 @@ class PredictionResponse(BaseModel):
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class AddLotRequest(BaseModel):
+    ticker: str
+    qty: float
+    buy_price_usd: float
+    buy_fx_rate: Optional[float] = None  # USD/MXN at purchase time
+    buy_date: Optional[str] = None       # YYYY-MM-DD
+
+
+class SetTargetRequest(BaseModel):
+    target_price: Optional[float] = None
+    stop_loss_price: Optional[float] = None
+
+
 DEFAULT_TICKERS = [
     "INTC", "SMCI", "VIST", "DELL", "QCOM", "NTR", "MELI",
     "BABA", "TQQQ", "NVDA", "WDC", "SLV",
@@ -532,7 +545,8 @@ async def list_alerts(unread_only: bool = False, limit: int = 50):
 @api_router.post("/alerts/sync")
 async def sync_alerts():
     created = await _check_price_moves()
-    return {"created": created}
+    target_created = await _check_target_crosses()
+    return {"created": created + target_created, "price_moves": created, "target_hits": target_created}
 
 
 @api_router.post("/alerts/{alert_id}/read")
@@ -555,6 +569,238 @@ async def clear_alerts():
     return {"deleted": res.deleted_count}
 
 
+# ---------- Portfolio (positions, lots, targets) ----------
+async def _aggregate_position(ticker: str, mxn_rate: float, current_price: Optional[float]):
+    """Compute aggregated position metrics for a ticker."""
+    lots = await db.position_lots.find({"ticker": ticker}, {"_id": 0}).sort("buy_date", 1).to_list(1000)
+    if not lots:
+        return None
+
+    total_qty = 0.0
+    total_cost_usd = 0.0
+    total_cost_mxn = 0.0
+    for lot in lots:
+        qty = float(lot["qty"])
+        price = float(lot["buy_price_usd"])
+        fx = float(lot.get("buy_fx_rate") or mxn_rate)
+        total_qty += qty
+        total_cost_usd += qty * price
+        total_cost_mxn += qty * price * fx
+
+    avg_cost_usd = total_cost_usd / total_qty if total_qty else 0.0
+    avg_cost_mxn = total_cost_mxn / total_qty if total_qty else 0.0
+
+    target_doc = await db.position_targets.find_one({"ticker": ticker}, {"_id": 0})
+    target_price = target_doc.get("target_price") if target_doc else None
+    stop_loss_price = target_doc.get("stop_loss_price") if target_doc else None
+
+    market_value_usd = (current_price or 0.0) * total_qty if current_price else None
+    market_value_mxn = (market_value_usd * mxn_rate) if market_value_usd is not None else None
+    pnl_usd = (market_value_usd - total_cost_usd) if market_value_usd is not None else None
+    pnl_pct = (pnl_usd / total_cost_usd * 100) if (pnl_usd is not None and total_cost_usd) else None
+    pnl_mxn = (market_value_mxn - total_cost_mxn) if market_value_mxn is not None else None
+
+    target_distance_pct = None
+    if target_price and current_price:
+        target_distance_pct = ((target_price - current_price) / current_price) * 100
+    stop_distance_pct = None
+    if stop_loss_price and current_price:
+        stop_distance_pct = ((current_price - stop_loss_price) / current_price) * 100
+
+    target_pnl_usd = ((target_price - avg_cost_usd) * total_qty) if target_price else None
+    target_pnl_pct = ((target_price - avg_cost_usd) / avg_cost_usd * 100) if (target_price and avg_cost_usd) else None
+
+    return {
+        "ticker": ticker,
+        "qty": round(total_qty, 6),
+        "avg_cost_usd": round(avg_cost_usd, 4),
+        "avg_cost_mxn": round(avg_cost_mxn, 4),
+        "total_cost_usd": round(total_cost_usd, 2),
+        "total_cost_mxn": round(total_cost_mxn, 2),
+        "current_price": current_price,
+        "market_value_usd": round(market_value_usd, 2) if market_value_usd is not None else None,
+        "market_value_mxn": round(market_value_mxn, 2) if market_value_mxn is not None else None,
+        "pnl_usd": round(pnl_usd, 2) if pnl_usd is not None else None,
+        "pnl_mxn": round(pnl_mxn, 2) if pnl_mxn is not None else None,
+        "pnl_pct": round(pnl_pct, 2) if pnl_pct is not None else None,
+        "target_price": target_price,
+        "stop_loss_price": stop_loss_price,
+        "target_distance_pct": round(target_distance_pct, 2) if target_distance_pct is not None else None,
+        "stop_distance_pct": round(stop_distance_pct, 2) if stop_distance_pct is not None else None,
+        "target_pnl_usd": round(target_pnl_usd, 2) if target_pnl_usd is not None else None,
+        "target_pnl_pct": round(target_pnl_pct, 2) if target_pnl_pct is not None else None,
+        "lots_count": len(lots),
+    }
+
+
+@api_router.get("/portfolio")
+async def get_portfolio():
+    tickers = await db.position_lots.distinct("ticker")
+    if not tickers:
+        return {"positions": [], "totals": {"cost_usd": 0, "value_usd": 0, "pnl_usd": 0, "pnl_pct": 0, "cost_mxn": 0, "value_mxn": 0, "pnl_mxn": 0}, "mxn_rate": await get_usd_mxn_rate()}
+
+    mxn_rate = await get_usd_mxn_rate()
+
+    async def fetch_price(t):
+        try:
+            q = await fetch_quote(t, mxn_rate)
+            return t, q.price
+        except Exception as e:
+            logger.warning(f"portfolio price fetch {t}: {e}")
+            return t, None
+
+    price_pairs = await asyncio.gather(*[fetch_price(t) for t in tickers])
+    prices = {t: p for t, p in price_pairs}
+
+    positions = []
+    for t in tickers:
+        pos = await _aggregate_position(t, mxn_rate, prices.get(t))
+        if pos:
+            positions.append(pos)
+
+    cost_usd = sum(p["total_cost_usd"] for p in positions)
+    cost_mxn = sum(p["total_cost_mxn"] for p in positions)
+    value_usd = sum((p["market_value_usd"] or 0) for p in positions)
+    value_mxn = sum((p["market_value_mxn"] or 0) for p in positions)
+    pnl_usd = value_usd - cost_usd
+    pnl_mxn = value_mxn - cost_mxn
+    pnl_pct = (pnl_usd / cost_usd * 100) if cost_usd else 0
+
+    return {
+        "positions": positions,
+        "totals": {
+            "cost_usd": round(cost_usd, 2),
+            "cost_mxn": round(cost_mxn, 2),
+            "value_usd": round(value_usd, 2),
+            "value_mxn": round(value_mxn, 2),
+            "pnl_usd": round(pnl_usd, 2),
+            "pnl_mxn": round(pnl_mxn, 2),
+            "pnl_pct": round(pnl_pct, 2),
+        },
+        "mxn_rate": mxn_rate,
+    }
+
+
+@api_router.get("/portfolio/lots/{ticker}")
+async def get_lots(ticker: str):
+    ticker = ticker.upper()
+    lots = await db.position_lots.find({"ticker": ticker}, {"_id": 0}).sort("buy_date", 1).to_list(1000)
+    return {"ticker": ticker, "lots": lots}
+
+
+@api_router.post("/portfolio/lots")
+async def add_lot(req: AddLotRequest):
+    ticker = req.ticker.strip().upper()
+    if not ticker or not re.match(r"^[A-Z0-9.\-]{1,10}$", ticker):
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+    if req.qty <= 0:
+        raise HTTPException(status_code=400, detail="qty must be > 0")
+    if req.buy_price_usd <= 0:
+        raise HTTPException(status_code=400, detail="buy_price_usd must be > 0")
+
+    fx = req.buy_fx_rate if req.buy_fx_rate and req.buy_fx_rate > 0 else await get_usd_mxn_rate()
+    buy_date = req.buy_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "ticker": ticker,
+        "qty": float(req.qty),
+        "buy_price_usd": float(req.buy_price_usd),
+        "buy_fx_rate": float(fx),
+        "buy_date": buy_date,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.position_lots.insert_one(doc)
+    return {k: v for k, v in doc.items() if k != "_id"}
+
+
+@api_router.delete("/portfolio/lots/{lot_id}")
+async def delete_lot(lot_id: str):
+    res = await db.position_lots.delete_one({"id": lot_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Lot not found")
+    return {"id": lot_id, "deleted": True}
+
+
+@api_router.put("/portfolio/target/{ticker}")
+async def set_target(ticker: str, req: SetTargetRequest):
+    ticker = ticker.upper()
+    if req.target_price is None and req.stop_loss_price is None:
+        raise HTTPException(status_code=400, detail="Provide target_price or stop_loss_price")
+    if req.target_price is not None and req.target_price <= 0:
+        raise HTTPException(status_code=400, detail="target_price must be > 0")
+    if req.stop_loss_price is not None and req.stop_loss_price <= 0:
+        raise HTTPException(status_code=400, detail="stop_loss_price must be > 0")
+
+    update = {"updated_at": datetime.now(timezone.utc).isoformat()}
+    if req.target_price is not None:
+        update["target_price"] = float(req.target_price)
+    if req.stop_loss_price is not None:
+        update["stop_loss_price"] = float(req.stop_loss_price)
+    await db.position_targets.update_one({"ticker": ticker}, {"$set": update}, upsert=True)
+    return {"ticker": ticker, **update}
+
+
+@api_router.delete("/portfolio/target/{ticker}")
+async def delete_target(ticker: str):
+    ticker = ticker.upper()
+    res = await db.position_targets.delete_one({"ticker": ticker})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Target not found")
+    return {"ticker": ticker, "deleted": True}
+
+
+async def _check_target_crosses() -> int:
+    """Emit alerts when current price crosses a target (up) or stop-loss (down)."""
+    targets = await db.position_targets.find({}, {"_id": 0}).to_list(500)
+    if not targets:
+        return 0
+    mxn_rate = await get_usd_mxn_rate()
+    created = 0
+    for tgt in targets:
+        ticker = tgt["ticker"]
+        # only alert if user actually holds this ticker
+        has_lots = await db.position_lots.find_one({"ticker": ticker}, {"_id": 0})
+        if not has_lots:
+            continue
+        try:
+            q = await fetch_quote(ticker, mxn_rate)
+        except Exception as e:
+            logger.warning(f"target check fetch {ticker}: {e}")
+            continue
+        state = await db.ticker_state.find_one({"ticker": ticker}, {"_id": 0}) or {}
+        prev_price = state.get("last_price")
+        if not prev_price or not q.price:
+            continue
+
+        target = tgt.get("target_price")
+        sl = tgt.get("stop_loss_price")
+        last_target_alert = state.get("last_target_alert_at")
+        last_sl_alert = state.get("last_sl_alert_at")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        recent_cutoff = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+
+        if target and prev_price < target <= q.price and (not last_target_alert or last_target_alert < recent_cutoff):
+            await _create_alert(
+                ticker=ticker,
+                atype="target_hit",
+                message=f"{ticker} crossed target ${target:.2f} — current ${q.price:.2f}",
+                payload={"target_price": target, "current_price": q.price, "prev_price": prev_price},
+            )
+            await db.ticker_state.update_one({"ticker": ticker}, {"$set": {"last_target_alert_at": now_iso}}, upsert=True)
+            created += 1
+        if sl and prev_price > sl >= q.price and (not last_sl_alert or last_sl_alert < recent_cutoff):
+            await _create_alert(
+                ticker=ticker,
+                atype="stop_loss_hit",
+                message=f"{ticker} hit stop-loss ${sl:.2f} — current ${q.price:.2f}",
+                payload={"stop_loss_price": sl, "current_price": q.price, "prev_price": prev_price},
+            )
+            await db.ticker_state.update_one({"ticker": ticker}, {"$set": {"last_sl_alert_at": now_iso}}, upsert=True)
+            created += 1
+    return created
+
+
 # ---------- Background scheduler ----------
 async def _alerts_loop():
     # initial delay to let app boot
@@ -562,8 +808,10 @@ async def _alerts_loop():
     while True:
         try:
             n = await _check_price_moves()
-            if n:
-                logger.info(f"alerts_loop: {n} new alerts")
+            t = await _check_target_crosses()
+            total = (n or 0) + (t or 0)
+            if total:
+                logger.info(f"alerts_loop: {total} new alerts ({n} price, {t} target)")
         except Exception as e:
             logger.error(f"alerts_loop iteration failed: {e}")
         await asyncio.sleep(600)  # 10 minutes

@@ -8,6 +8,7 @@ import StockDetailSheet from "../components/StockDetailSheet";
 import CompareSheet from "../components/CompareSheet";
 import TopMoversDialog from "../components/TopMoversDialog";
 import AlertsBell from "../components/AlertsBell";
+import PortfolioPanel from "../components/PortfolioPanel";
 import { Button } from "../components/ui/button";
 
 export default function Dashboard() {
@@ -20,6 +21,7 @@ export default function Dashboard() {
   const [moversOpen, setMoversOpen] = useState(false);
   const [selectedTicker, setSelectedTicker] = useState(null);
   const [fetchedAt, setFetchedAt] = useState(null);
+  const [view, setView] = useState("watchlist"); // 'watchlist' | 'portfolio'
 
   const loadQuotes = useCallback(async (silent = false) => {
     if (!silent) setRefreshing(true);
@@ -149,70 +151,104 @@ export default function Dashboard() {
         </div>
       </header>
 
-      {/* Metric strip */}
-      <section className="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-8 pt-8">
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 md:gap-6">
-          <MetricTile label="Activos" value={quotes.length} testId="metric-total" />
-          <MetricTile
-            label="Al alza"
-            value={stats.gainers}
-            tone="bull"
-            icon={<TrendUp size={16} weight="bold" />}
-            testId="metric-gainers"
-          />
-          <MetricTile
-            label="A la baja"
-            value={stats.losers}
-            tone="bear"
-            icon={<TrendDown size={16} weight="bold" />}
-            testId="metric-losers"
-          />
-          <MetricTile
-            label="Cambio prom."
-            value={`${stats.avg >= 0 ? "+" : ""}${stats.avg.toFixed(2)}%`}
-            tone={stats.avg >= 0 ? "bull" : "bear"}
-            testId="metric-avg"
-          />
+      {/* View toggle */}
+      <section className="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-8 pt-6">
+        <div className="inline-flex items-center rounded-lg border border-line bg-obsidian-surface p-1" data-testid="view-toggle">
+          <button
+            type="button"
+            onClick={() => setView("watchlist")}
+            data-testid="view-watchlist"
+            className={`text-xs uppercase tracking-widest px-4 py-2 rounded-md transition-colors ${
+              view === "watchlist" ? "bg-brand/15 text-brand" : "text-ink-secondary hover:text-ink-primary"
+            }`}
+          >
+            Watchlist
+          </button>
+          <button
+            type="button"
+            onClick={() => setView("portfolio")}
+            data-testid="view-portfolio"
+            className={`text-xs uppercase tracking-widest px-4 py-2 rounded-md transition-colors ${
+              view === "portfolio" ? "bg-brand/15 text-brand" : "text-ink-secondary hover:text-ink-primary"
+            }`}
+          >
+            Portafolio
+          </button>
         </div>
       </section>
 
-      {/* Grid */}
-      <main className="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-heading text-sm font-medium text-ink-secondary uppercase tracking-widest">
-            Watchlist
-          </h2>
-          <span className="text-mono text-xs text-ink-muted">
-            {quotes.length} símbolos
-          </span>
-        </div>
+      {view === "watchlist" ? (
+        <>
+          {/* Metric strip */}
+          <section className="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-8 pt-6">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 md:gap-6">
+              <MetricTile label="Activos" value={quotes.length} testId="metric-total" />
+              <MetricTile
+                label="Al alza"
+                value={stats.gainers}
+                tone="bull"
+                icon={<TrendUp size={16} weight="bold" />}
+                testId="metric-gainers"
+              />
+              <MetricTile
+                label="A la baja"
+                value={stats.losers}
+                tone="bear"
+                icon={<TrendDown size={16} weight="bold" />}
+                testId="metric-losers"
+              />
+              <MetricTile
+                label="Cambio prom."
+                value={`${stats.avg >= 0 ? "+" : ""}${stats.avg.toFixed(2)}%`}
+                tone={stats.avg >= 0 ? "bull" : "bear"}
+                testId="metric-avg"
+              />
+            </div>
+          </section>
 
-        {loading ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 md:gap-6">
-            {Array.from({ length: 8 }).map((_, i) => (
-              <div key={i} className="h-44 rounded-xl border border-line bg-obsidian-surface animate-pulse" />
-            ))}
-          </div>
-        ) : quotes.length === 0 ? (
-          <EmptyState onAdd={() => setAddOpen(true)} />
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 md:gap-6" data-testid="stock-grid">
-            {quotes.map((q, idx) => (
-              <div
-                key={q.ticker}
-                className="animate-fade-up"
-                style={{ animationDelay: `${idx * 35}ms` }}
-              >
-                <StockCard
-                  quote={q}
-                  onSelect={() => setSelectedTicker(q.ticker)}
-                  onRemove={() => handleRemove(q.ticker)}
-                />
+          {/* Grid */}
+          <main className="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-8 py-8">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-heading text-sm font-medium text-ink-secondary uppercase tracking-widest">
+                Watchlist
+              </h2>
+              <span className="text-mono text-xs text-ink-muted">
+                {quotes.length} símbolos
+              </span>
+            </div>
+
+            {loading ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 md:gap-6">
+                {Array.from({ length: 8 }).map((_, i) => (
+                  <div key={i} className="h-44 rounded-xl border border-line bg-obsidian-surface animate-pulse" />
+                ))}
               </div>
-            ))}
-          </div>
-        )}
-      </main>
+            ) : quotes.length === 0 ? (
+              <EmptyState onAdd={() => setAddOpen(true)} />
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 md:gap-6" data-testid="stock-grid">
+                {quotes.map((q, idx) => (
+                  <div
+                    key={q.ticker}
+                    className="animate-fade-up"
+                    style={{ animationDelay: `${idx * 35}ms` }}
+                  >
+                    <StockCard
+                      quote={q}
+                      onSelect={() => setSelectedTicker(q.ticker)}
+                      onRemove={() => handleRemove(q.ticker)}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+          </main>
+        </>
+      ) : (
+        <main className="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-8 py-8">
+          <PortfolioPanel mxnRate={mxnRate} watchlistTickers={quotes.map((q) => q.ticker)} />
+        </main>
+      )}
 
       <AddStockDialog open={addOpen} onOpenChange={setAddOpen} onAdd={handleAdd} />
       <CompareSheet
