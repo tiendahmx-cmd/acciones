@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { Plus, Pencil, Wallet, X, Target, Shield, TrendUp, TrendDown, Trash, Calendar, ChartLineUp } from "@phosphor-icons/react";
+import { Plus, Pencil, Wallet, X, Target, Shield, TrendUp, TrendDown, Trash, Calendar, ChartLineUp, CashRegister } from "@phosphor-icons/react";
 import { toast } from "sonner";
 import { api, fmtUSD, fmtMXN, fmtPct, fmtNumber } from "../lib/api";
 import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "./ui/dialog";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
+import SellPositionDialog from "./SellPositionDialog";
 
 export default function PortfolioPanel({ mxnRate, watchlistTickers = [] }) {
   const [data, setData] = useState(null);
@@ -13,6 +14,7 @@ export default function PortfolioPanel({ mxnRate, watchlistTickers = [] }) {
   const [addOpen, setAddOpen] = useState(false);
   const [editTarget, setEditTarget] = useState(null);   // ticker
   const [viewLots, setViewLots] = useState(null);       // ticker
+  const [sellTicker, setSellTicker] = useState(null);   // ticker
 
   const load = async () => {
     setLoading(true);
@@ -97,6 +99,7 @@ export default function PortfolioPanel({ mxnRate, watchlistTickers = [] }) {
               pos={p}
               onSetTarget={() => setEditTarget(p.ticker)}
               onViewLots={() => setViewLots(p.ticker)}
+              onSell={() => setSellTicker(p.ticker)}
             />
           ))}
         </div>
@@ -130,6 +133,16 @@ export default function PortfolioPanel({ mxnRate, watchlistTickers = [] }) {
           await load();
         }}
       />
+      <SellPositionDialog
+        position={positions.find((p) => p.ticker === sellTicker)}
+        open={!!sellTicker}
+        onClose={() => setSellTicker(null)}
+        onSold={async () => {
+          setSellTicker(null);
+          await load();
+        }}
+        defaultRate={mxnRate}
+      />
     </div>
   );
 }
@@ -145,7 +158,7 @@ function SummaryTile({ label, primary, secondary, tone, testId }) {
   );
 }
 
-function PositionCard({ pos, onSetTarget, onViewLots }) {
+function PositionCard({ pos, onSetTarget, onViewLots, onSell }) {
   const isProfit = (pos.pnl_pct ?? 0) >= 0;
   const toneCls = isProfit ? "text-bull" : "text-bear";
   const Icon = isProfit ? TrendUp : TrendDown;
@@ -230,6 +243,14 @@ function PositionCard({ pos, onSetTarget, onViewLots }) {
           data-testid={`view-lots-${pos.ticker}`}
         >
           <Calendar size={12} /> Ver lotes ({pos.lots_count})
+        </button>
+        <button
+          type="button"
+          onClick={onSell}
+          className="text-xs flex items-center gap-1 px-2.5 py-1 rounded-md border border-line bg-obsidian text-ink-secondary hover:bg-bull-soft hover:text-bull hover:border-bull-line transition-colors"
+          data-testid={`sell-${pos.ticker}`}
+        >
+          <CashRegister size={12} weight="bold" /> Vender
         </button>
       </div>
     </div>

@@ -9,6 +9,7 @@ import CompareSheet from "../components/CompareSheet";
 import TopMoversDialog from "../components/TopMoversDialog";
 import AlertsBell from "../components/AlertsBell";
 import PortfolioPanel from "../components/PortfolioPanel";
+import ClosedTradesPanel from "../components/ClosedTradesPanel";
 import { Button } from "../components/ui/button";
 
 export default function Dashboard() {
@@ -174,6 +175,16 @@ export default function Dashboard() {
           >
             Portafolio
           </button>
+          <button
+            type="button"
+            onClick={() => setView("history")}
+            data-testid="view-history"
+            className={`text-xs uppercase tracking-widest px-4 py-2 rounded-md transition-colors ${
+              view === "history" ? "bg-brand/15 text-brand" : "text-ink-secondary hover:text-ink-primary"
+            }`}
+          >
+            Historial
+          </button>
         </div>
       </section>
 
@@ -244,9 +255,13 @@ export default function Dashboard() {
             )}
           </main>
         </>
-      ) : (
+      ) : view === "portfolio" ? (
         <main className="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-8 py-8">
           <PortfolioPanel mxnRate={mxnRate} watchlistTickers={quotes.map((q) => q.ticker)} />
+        </main>
+      ) : (
+        <main className="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-8 py-8">
+          <ClosedTradesPanel />
         </main>
       )}
 

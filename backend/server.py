@@ -84,6 +84,16 @@ class SetTargetRequest(BaseModel):
     stop_loss_price: Optional[float] = None
 
 
+class SellRequest(BaseModel):
+    ticker: str
+    qty: float
+    sell_price_usd: float
+    sell_fx_rate: Optional[float] = None
+    sell_date: Optional[str] = None
+    method: str = "FIFO"  # FIFO | LIFO | SPECIFIC
+    lot_ids: Optional[List[str]] = None  # required when method=SPECIFIC
+
+
 DEFAULT_TICKERS = [
     "INTC", "SMCI", "VIST", "DELL", "QCOM", "NTR", "MELI",
     "BABA", "TQQQ", "NVDA", "WDC", "SLV",
@@ -750,6 +760,198 @@ async def delete_target(ticker: str):
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Target not found")
     return {"ticker": ticker, "deleted": True}
+
+
+# ---------- Sell (close trade) ----------
+@api_router.post("/portfolio/sell")
+async def sell_position(req: SellRequest):
+    ticker = req.ticker.strip().upper()
+    if req.qty <= 0:
+        raise HTTPException(status_code=400, detail="qty must be > 0")
+    if req.sell_price_usd <= 0:
+        raise HTTPException(status_code=400, detail="sell_price_usd must be > 0")
+    method = (req.method or "FIFO").upper()
+    if method not in ("FIFO", "LIFO", "SPECIFIC"):
+        raise HTTPException(status_code=400, detail="method must be FIFO, LIFO or SPECIFIC")
+
+    lots = await db.position_lots.find({"ticker": ticker}, {"_id": 0}).to_list(1000)
+    if not lots:
+        raise HTTPException(status_code=404, detail=f"No lots for {ticker}")
+
+    total_qty = sum(float(l["qty"]) for l in lots)
+    if req.qty - total_qty > 1e-9:
+        raise HTTPException(status_code=400, detail=f"qty {req.qty} exceeds position {total_qty}")
+
+    # Sort lots according to method
+    if method == "FIFO":
+        lots.sort(key=lambda l: l.get("buy_date", ""))
+    elif method == "LIFO":
+        lots.sort(key=lambda l: l.get("buy_date", ""), reverse=True)
+    else:  # SPECIFIC
+        if not req.lot_ids:
+            raise HTTPException(status_code=400, detail="lot_ids required for SPECIFIC method")
+        lot_map = {l["id"]: l for l in lots}
+        ordered = []
+        for lid in req.lot_ids:
+            if lid not in lot_map:
+                raise HTTPException(status_code=400, detail=f"lot {lid} not found")
+            ordered.append(lot_map[lid])
+        lots = ordered
+        avail = sum(float(l["qty"]) for l in lots)
+        if req.qty - avail > 1e-9:
+            raise HTTPException(status_code=400, detail=f"selected lots provide only {avail} shares")
+
+    sell_fx = req.sell_fx_rate if req.sell_fx_rate and req.sell_fx_rate > 0 else await get_usd_mxn_rate()
+    sell_date = req.sell_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    sell_price = float(req.sell_price_usd)
+
+    remaining = float(req.qty)
+    allocations = []
+    cost_usd_total = 0.0
+    cost_mxn_total = 0.0
+    weighted_days = 0.0
+
+    try:
+        sell_dt = datetime.strptime(sell_date, "%Y-%m-%d")
+    except Exception:
+        sell_dt = datetime.now(timezone.utc)
+
+    for lot in lots:
+        if remaining <= 1e-9:
+            break
+        lot_qty = float(lot["qty"])
+        consumed = min(lot_qty, remaining)
+        buy_price = float(lot["buy_price_usd"])
+        buy_fx = float(lot.get("buy_fx_rate") or sell_fx)
+        try:
+            buy_dt = datetime.strptime(lot.get("buy_date", sell_date), "%Y-%m-%d")
+        except Exception:
+            buy_dt = sell_dt
+        days = max(0, (sell_dt - buy_dt).days)
+
+        cost_usd = buy_price * consumed
+        cost_mxn = buy_price * consumed * buy_fx
+        proceeds_usd = sell_price * consumed
+        proceeds_mxn = sell_price * consumed * sell_fx
+        pnl_usd = proceeds_usd - cost_usd
+        pnl_mxn = proceeds_mxn - cost_mxn
+
+        cost_usd_total += cost_usd
+        cost_mxn_total += cost_mxn
+        weighted_days += days * consumed
+
+        allocations.append({
+            "lot_id": lot["id"],
+            "qty": round(consumed, 6),
+            "buy_price_usd": round(buy_price, 4),
+            "buy_fx_rate": round(buy_fx, 4),
+            "buy_date": lot.get("buy_date"),
+            "days_held": days,
+            "cost_usd": round(cost_usd, 2),
+            "cost_mxn": round(cost_mxn, 2),
+            "pnl_usd": round(pnl_usd, 2),
+            "pnl_mxn": round(pnl_mxn, 2),
+        })
+
+        new_qty = lot_qty - consumed
+        if new_qty <= 1e-9:
+            await db.position_lots.delete_one({"id": lot["id"]})
+        else:
+            await db.position_lots.update_one({"id": lot["id"]}, {"$set": {"qty": round(new_qty, 6)}})
+
+        remaining -= consumed
+
+    sold_qty = float(req.qty)
+    proceeds_usd = sell_price * sold_qty
+    proceeds_mxn = sell_price * sold_qty * sell_fx
+    pnl_usd = proceeds_usd - cost_usd_total
+    pnl_mxn = proceeds_mxn - cost_mxn_total
+    return_pct = (pnl_usd / cost_usd_total * 100) if cost_usd_total else 0
+    avg_days = (weighted_days / sold_qty) if sold_qty else 0
+    annualized = ((proceeds_usd / cost_usd_total) ** (365 / max(avg_days, 1)) - 1) * 100 if cost_usd_total and avg_days > 0 else None
+
+    trade_doc = {
+        "id": str(uuid.uuid4()),
+        "ticker": ticker,
+        "qty_sold": round(sold_qty, 6),
+        "sell_price_usd": round(sell_price, 4),
+        "sell_fx_rate": round(sell_fx, 4),
+        "sell_date": sell_date,
+        "method": method,
+        "allocations": allocations,
+        "cost_usd": round(cost_usd_total, 2),
+        "cost_mxn": round(cost_mxn_total, 2),
+        "proceeds_usd": round(proceeds_usd, 2),
+        "proceeds_mxn": round(proceeds_mxn, 2),
+        "pnl_usd": round(pnl_usd, 2),
+        "pnl_mxn": round(pnl_mxn, 2),
+        "return_pct": round(return_pct, 2),
+        "avg_days_held": round(avg_days, 1),
+        "annualized_return_pct": round(annualized, 2) if annualized is not None else None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.closed_trades.insert_one(trade_doc)
+    return {k: v for k, v in trade_doc.items() if k != "_id"}
+
+
+@api_router.get("/portfolio/trades")
+async def list_trades(limit: int = 200):
+    trades = await db.closed_trades.find({}, {"_id": 0}).sort("sell_date", -1).to_list(limit)
+    total_pnl_usd = sum(t.get("pnl_usd", 0) for t in trades)
+    total_pnl_mxn = sum(t.get("pnl_mxn", 0) for t in trades)
+    total_cost = sum(t.get("cost_usd", 0) for t in trades)
+    wins = sum(1 for t in trades if t.get("pnl_usd", 0) > 0)
+    losses = sum(1 for t in trades if t.get("pnl_usd", 0) < 0)
+    decided = wins + losses
+    win_rate = (wins / decided * 100) if decided else 0
+    return {
+        "trades": trades,
+        "summary": {
+            "count": len(trades),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 1),
+            "total_pnl_usd": round(total_pnl_usd, 2),
+            "total_pnl_mxn": round(total_pnl_mxn, 2),
+            "total_cost_usd": round(total_cost, 2),
+            "total_return_pct": round(total_pnl_usd / total_cost * 100, 2) if total_cost else 0,
+        },
+    }
+
+
+@api_router.get("/portfolio/trades/equity-curve")
+async def trades_equity_curve():
+    trades = await db.closed_trades.find({}, {"_id": 0}).sort("sell_date", 1).to_list(2000)
+    monthly: dict = {}
+    for t in trades:
+        sd = t.get("sell_date") or ""
+        if len(sd) < 7:
+            continue
+        key = sd[:7]  # YYYY-MM
+        m = monthly.setdefault(key, {"month": key, "pnl_usd": 0.0, "pnl_mxn": 0.0, "trades": 0})
+        m["pnl_usd"] += float(t.get("pnl_usd", 0))
+        m["pnl_mxn"] += float(t.get("pnl_mxn", 0))
+        m["trades"] += 1
+
+    points = sorted(monthly.values(), key=lambda x: x["month"])
+    cum_usd = 0.0
+    cum_mxn = 0.0
+    for p in points:
+        cum_usd += p["pnl_usd"]
+        cum_mxn += p["pnl_mxn"]
+        p["cumulative_usd"] = round(cum_usd, 2)
+        p["cumulative_mxn"] = round(cum_mxn, 2)
+        p["pnl_usd"] = round(p["pnl_usd"], 2)
+        p["pnl_mxn"] = round(p["pnl_mxn"], 2)
+    return {"points": points}
+
+
+@api_router.delete("/portfolio/trades/{trade_id}")
+async def delete_trade(trade_id: str):
+    res = await db.closed_trades.delete_one({"id": trade_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    return {"id": trade_id, "deleted": True}
 
 
 async def _check_target_crosses() -> int:

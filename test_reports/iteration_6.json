@@ -1,0 +1,34 @@
+{
+  "summary": "Iteration 6: Closed-trades (sell) feature backend testing. Created /app/backend/tests/test_trades.py with 17 tests covering POST /api/portfolio/sell (FIFO, LIFO, SPECIFIC, partial split, full consumption, validation errors), GET /api/portfolio/trades (sorting + summary), GET /api/portfolio/trades/equity-curve (monthly cumulative), DELETE /api/portfolio/trades/{id}, plus regression. Full suite: 69/69 PASS = 17 new + 52 prior (16 backend_test + 12 alerts + 24 portfolio). Watchlist 12-default seed preserved. No critical issues found.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/portfolio/sell", "issue": "qty>total error message has order swapped: detail says 'qty {req.qty} exceeds position {total_qty}' which is correct, but the comparison `req.qty - total_qty > 1e-9` correctly rejects the over-sell. No bug, just style."},
+      {"endpoint": "POST /api/portfolio/sell", "issue": "When method=SPECIFIC and lot_ids subset doesn't cover qty, response code is 400 with detail 'selected lots provide only X shares' — fine, but the ticker filter on lots happens before SPECIFIC filtering, so a lot_id from a *different* ticker would silently 404 with 'lot {id} not found' — acceptable but could be clearer."},
+      {"endpoint": "POST /api/portfolio/sell", "issue": "annualized_return_pct can be very large for short holds (e.g. days_held=1) and may explode for negative cost cases; works as designed but consider capping for UI."},
+      {"endpoint": "GET /api/portfolio/trades", "issue": "sell_date sort is lexicographic on YYYY-MM-DD strings — correct here; if sell_date format ever changes, sort will break."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_trades.py",
+    "/app/test_reports/pytest/iter6_trades.xml",
+    "/app/test_reports/pytest/iter6_full.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is 1044 lines — close to the 700-line guideline threshold; consider splitting into modules (quotes.py, portfolio.py, trades.py, alerts.py) for maintainability.",
+    "Sell endpoint mutates lots and inserts trade doc without a transaction — if the insert into closed_trades fails after lots are mutated, the position becomes inconsistent (lots reduced/deleted but no trade record). Consider wrapping in a Mongo session/transaction or insert trade FIRST and then mutate lots.",
+    "annualized_return_pct formula uses (proceeds/cost)^(365/days)-1; for losing trades with proceeds<cost this still computes a real number but for very short holds the magnitude is unrealistic. Consider clamping or NaN-guarding.",
+    "_check_target_crosses still does not write back last_price — relies on _check_price_moves running AFTER it. The fragile coupling noted in iter 5 remains; not a regression, but worth a refactor.",
+    "Sell payload accepts buy_date/sell_date as plain strings without strict validation — strptime in fallback uses now(); a malformed date silently uses today, which can corrupt days_held calculations."
+  ],
+  "updated_files": ["/app/backend/tests/test_trades.py"],
+  "success_rate": {"backend": "100% (69/69 — trades 17/17, portfolio 24/24, alerts 12/12, backend_test 16/16)", "frontend": "N/A (backend-only)"},
+  "test_credentials": "N/A",
+  "seed_data_creation": "test_trades.py seeds NVDA/TSLA/AMZN lots and synthetic closed_trades via pymongo. Final cleanup drops position_lots, position_targets, closed_trades, alerts, ticker_state. Watchlist 12-default seed preserved.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Iteration 6 complete. New file /app/backend/tests/test_trades.py is the canonical regression for sell/trades. Full test corpus is now 69 tests across test_trades.py + test_portfolio.py + test_alerts.py + backend_test.py. Run with: pytest backend/tests/ -v. Watchlist defaults (12 tickers) intact. closed_trades is the new collection introduced this iteration.",
+  "rca of the issue": "No bugs found. One self-inflicted false positive in the test (assertion `'_id' not in str(d)` matched the substring inside `lot_id`) was fixed by checking key membership instead of substring. All sell-method allocations, lot mutations (partial reduce vs full delete), validation error codes (400 for qty<=0, sell_price<=0, invalid method, missing lot_ids, unknown lot_id, qty>total; 404 for no-lots-ticker), summary aggregation (count/wins/losses/win_rate/total_pnl/return_pct), and equity-curve monthly cumulative arithmetic verified deterministically with seeded data."
+}
