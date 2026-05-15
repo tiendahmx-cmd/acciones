@@ -43,6 +43,15 @@ Web app with elegant dark UX/UI displaying real-time NASDAQ/NYSE quotes (INTC, S
 - Frontend `AlertsBell` with badge counter, popover, mark-as-read, clear-all, click-to-open-detail. Polls every 30s.
 - 28/28 backend tests pass (iter 3).
 
+### Iteration 4–5 (Portfolio / Posiciones)
+- New collections `position_lots`, `position_targets`.
+- **Lot tracking**: each compra es un lote independiente (qty + buy_price_usd + buy_fx_rate + buy_date). Costo promedio ponderado calculado en agregación.
+- **Target + Stop-Loss** por ticker (PUT/DELETE `/api/portfolio/target/{ticker}`).
+- **Aggregated portfolio** GET `/api/portfolio`: positions[], totals (cost_usd, cost_mxn, value_usd, value_mxn, pnl_usd, pnl_mxn, pnl_pct), mxn_rate.
+- **Cross alerts** (`target_hit` / `stop_loss_hit`) cuando el precio cruza el objetivo o stop con cooldown 6h. Solo se emiten si el usuario tiene lotes para ese ticker.
+- Frontend: tab toggle Watchlist/Portafolio, summary tiles (invertido / valor / P&L USD+MXN), position cards con P&L, target distance, stop-loss, ganancia proyectada al objetivo, AddLotDialog, SetTargetDialog, LotsListDialog (eliminar lotes).
+- 52/52 backend tests pass (iter 5 — fixed critical ordering bug donde `_check_price_moves` sobreescribía `last_price` antes que `_check_target_crosses` lo leyera).
+
 ## Backlog (P1)
 - Sparkline chart on each card (recharts).
 - Push notifications when prediction direction flips.
