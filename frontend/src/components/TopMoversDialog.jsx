@@ -183,7 +183,7 @@ function MoverColumn({ title, items, tone }) {
                 {q.ticker}
               </p>
               <p
-                className="text-mono text-[11px] text-ink-secondary"
+                className="text-mono text-sm font-medium text-ink-secondary"
                 style={{ fontFamily: "JetBrains Mono, monospace" }}
               >
                 {fmtMXN(q.price_mxn)}

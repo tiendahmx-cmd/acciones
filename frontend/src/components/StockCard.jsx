@@ -52,7 +52,7 @@ export default function StockCard({ quote, onSelect, onRemove }) {
         <p className="text-mono text-3xl font-semibold tracking-tight text-ink-primary" data-testid={`price-usd-${quote.ticker}`}>
           {fmtUSD(quote.price)}
         </p>
-        <p className="text-mono text-sm text-ink-secondary mt-1" data-testid={`price-mxn-${quote.ticker}`}>
+        <p className="text-mono text-xl font-medium text-ink-secondary mt-1" data-testid={`price-mxn-${quote.ticker}`}>
           {fmtMXN(quote.price_mxn)} <span className="text-ink-muted text-xs">MXN</span>
         </p>
       </div>

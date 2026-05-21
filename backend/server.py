@@ -15,6 +15,20 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 import yfinance as yf
+import math
+
+
+def _clean_float(v):
+    """Return None for NaN/inf floats so JSON serialization doesn't fail."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return f
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -162,7 +176,7 @@ def _fetch_quote_sync(ticker: str) -> dict:
             prev_close = float(hist.iloc[-2]["Close"])
         else:
             prev_close = float(info.get("previous_close") or info.get("previousClose") or open_p)
-        sparkline = [round(float(v), 2) for v in hist["Close"].tolist()]
+        sparkline = [round(float(v), 2) for v in hist["Close"].tolist() if v is not None and not (isinstance(v, float) and math.isnan(v))]
 
     if price is None:
         # fallback to fast_info
@@ -191,13 +205,13 @@ def _fetch_quote_sync(ticker: str) -> dict:
     return {
         "ticker": ticker.upper(),
         "name": name,
-        "price": price,
-        "change": change,
-        "change_percent": change_percent,
-        "open": open_p,
-        "high": high,
-        "low": low,
-        "previous_close": prev_close,
+        "price": _clean_float(price),
+        "change": _clean_float(change),
+        "change_percent": _clean_float(change_percent),
+        "open": _clean_float(open_p),
+        "high": _clean_float(high),
+        "low": _clean_float(low),
+        "previous_close": _clean_float(prev_close),
         "volume": volume,
         "exchange": exchange,
         "sparkline": sparkline,
@@ -868,7 +882,14 @@ async def sell_position(req: SellRequest):
     pnl_mxn = proceeds_mxn - cost_mxn_total
     return_pct = (pnl_usd / cost_usd_total * 100) if cost_usd_total else 0
     avg_days = (weighted_days / sold_qty) if sold_qty else 0
-    annualized = ((proceeds_usd / cost_usd_total) ** (365 / max(avg_days, 1)) - 1) * 100 if cost_usd_total and avg_days > 0 else None
+    annualized = None
+    if cost_usd_total and avg_days > 0 and proceeds_usd > 0:
+        try:
+            annualized = ((proceeds_usd / cost_usd_total) ** (365 / max(avg_days, 1)) - 1) * 100
+            if math.isnan(annualized) or math.isinf(annualized):
+                annualized = None
+        except Exception:
+            annualized = None
 
     trade_doc = {
         "id": str(uuid.uuid4()),

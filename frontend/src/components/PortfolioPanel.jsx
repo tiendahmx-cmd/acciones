@@ -153,7 +153,7 @@ function SummaryTile({ label, primary, secondary, tone, testId }) {
     <div className="rounded-xl border border-line bg-obsidian-surface p-5 transition-all duration-200 hover:bg-obsidian-hover hover:border-line-focus" data-testid={testId}>
       <p className="text-xs uppercase tracking-widest text-ink-muted">{label}</p>
       <p className={`text-mono text-2xl font-semibold mt-3 ${toneCls}`}>{primary}</p>
-      <p className="text-mono text-xs text-ink-secondary mt-1">{secondary}</p>
+      <p className="text-mono text-base text-ink-secondary mt-1">{secondary}</p>
     </div>
   );
 }
@@ -184,7 +184,7 @@ function PositionCard({ pos, onSetTarget, onViewLots, onSell }) {
         <p className={`text-mono text-3xl font-semibold tracking-tight ${toneCls}`}>
           {(pos.pnl_usd ?? 0) >= 0 ? "+" : ""}{fmtUSD(pos.pnl_usd)}
         </p>
-        <p className={`text-mono text-sm mt-1 ${toneCls}`}>
+        <p className={`text-mono text-xl font-medium mt-1 ${toneCls}`}>
           {(pos.pnl_mxn ?? 0) >= 0 ? "+" : ""}{fmtMXN(pos.pnl_mxn)} <span className="text-ink-muted text-xs">MXN</span>
         </p>
       </div>

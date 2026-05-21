@@ -80,7 +80,7 @@ export default function StockDetailSheet({ ticker, open, onClose, mxnRate }) {
                   <p className="text-mono text-4xl font-semibold tracking-tight">
                     {fmtUSD(quote.price)}
                   </p>
-                  <p className="text-mono text-sm text-ink-secondary mt-1">
+                  <p className="text-mono text-2xl font-medium text-ink-secondary mt-1">
                     {fmtMXN(quote.price_mxn)} <span className="text-ink-muted text-xs">MXN</span>
                   </p>
                 </div>

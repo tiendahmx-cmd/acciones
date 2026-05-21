@@ -115,7 +115,7 @@ function SummaryTile({ label, primary, secondary, tone, testId }) {
     <div className="rounded-xl border border-line bg-obsidian-surface p-5 transition-all duration-200 hover:bg-obsidian-hover hover:border-line-focus" data-testid={testId}>
       <p className="text-xs uppercase tracking-widest text-ink-muted">{label}</p>
       <p className={`text-mono text-2xl font-semibold mt-3 ${cls}`}>{primary}</p>
-      <p className="text-mono text-xs text-ink-secondary mt-1">{secondary}</p>
+      <p className="text-mono text-base text-ink-secondary mt-1">{secondary}</p>
     </div>
   );
 }
@@ -144,7 +144,7 @@ function TradeRow({ trade, onRemove }) {
           <Cell label="Retorno" value={fmtPct(trade.return_pct)} tone={tone} />
         </div>
         <div className="text-right ml-auto">
-          <p className={`text-mono text-sm font-semibold ${tone}`}>{(trade.pnl_mxn ?? 0) >= 0 ? "+" : ""}{fmtMXN(trade.pnl_mxn)} <span className="text-ink-muted text-[10px]">MXN</span></p>
+          <p className={`text-mono text-lg font-semibold ${tone}`}>{(trade.pnl_mxn ?? 0) >= 0 ? "+" : ""}{fmtMXN(trade.pnl_mxn)} <span className="text-ink-muted text-[10px]">MXN</span></p>
           {trade.annualized_return_pct != null && (
             <p className="text-[10px] uppercase tracking-widest text-ink-muted mt-0.5">Anualizado {fmtPct(trade.annualized_return_pct)}</p>
           )}
