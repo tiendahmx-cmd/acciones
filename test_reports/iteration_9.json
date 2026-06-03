@@ -1,0 +1,28 @@
+{
+  "summary": "Iteration 9 regression retest of /api/portfolio data-isolation fix. Ran full test_auth.py suite (36 tests). All 36 passed including the four targeted isolation tests: test_portfolio_lots_isolated, test_non_admin_admin_all_silently_ignored_on_portfolio, test_admin_portfolio_without_admin_all_is_scoped, test_admin_portfolio_admin_all_cross_user.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_auth.py",
+    "/app/test_reports/pytest/iteration_9_auth.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "get_portfolio scope merge using dict(scope) with conditional existence-guard is correct - prevents overwriting per-user pinning while still excluding null/missing user_id docs for admin_all path."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (36/36)", "frontend": "N/A"},
+  "test_credentials": "Admin: admin@stocks.app / Admin#Stocks2026 (from /app/memory/test_credentials.md)",
+  "seed_data_creation": "None - tests use isolated registered users via fixtures",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 8 regression (portfolio isolation overwrite) is fully resolved in iter 9. test_auth.py is now a stable 36/36 pass baseline. Other test files (test_portfolio.py, test_trades.py, test_alerts.py, backend_test.py) were not executed in this iteration since the request was a targeted regression check.",
+  "rca of the issue": "Iter 8 introduced a bug where the admin_all existence-guard ({'user_id': {'$exists': True}}) was unconditionally added to the match pipeline, overwriting per-user scope pinning. Iter 9 fix uses dict(scope) and only adds the existence-guard when 'user_id' is not already pinned, preserving per-user scoping for non-admin and admin-without-admin_all paths. Regression verified passing."
+}

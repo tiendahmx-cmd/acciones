@@ -831,9 +831,12 @@ async def _aggregate_position(user_id: str, ticker: str, mxn_rate: float, curren
 @api_router.get("/portfolio")
 async def get_portfolio(request: Request, current_user: dict = Depends(get_current_user)):
     scope = user_filter(current_user, request)
-    # Aggregate per (user_id, ticker). Skip ownerless legacy docs just in case.
+    # Build match: ensure user_id is set when scoping, but never overwrite a pinned user_id.
+    match = dict(scope)
+    if "user_id" not in match:
+        match["user_id"] = {"$exists": True, "$ne": None}
     pipeline = [
-        {"$match": {**scope, "user_id": {"$exists": True, "$ne": None}}},
+        {"$match": match},
         {"$group": {"_id": {"user_id": "$user_id", "ticker": "$ticker"}}},
     ]
     pairs = await db.position_lots.aggregate(pipeline).to_list(10000)
