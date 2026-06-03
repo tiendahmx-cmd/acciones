@@ -1,7 +1,6 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 import asyncio
@@ -9,133 +8,40 @@ import json
 import re
 import uuid
 from pathlib import Path
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 
 import requests
 import yfinance as yf
 import math
-import bcrypt
-import jwt
-
-
-def _clean_float(v):
-    """Return None for NaN/inf floats so JSON serialization doesn't fail."""
-    if v is None:
-        return None
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    if math.isnan(f) or math.isinf(f):
-        return None
-    return f
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-# MongoDB
-mongo_url = os.environ["MONGO_URL"]
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ["DB_NAME"]]
+# Shared deps (DB, JWT helpers, scope filters, current-user dep)
+from deps import (
+    db,
+    _clean_float,
+    hash_password,
+    verify_password,
+    get_current_user,
+    is_admin,
+    needs_scope,
+    user_filter,
+    require_admin,
+)
+from auth_routes import auth_router
+from admin_routes import admin_router
 
 # Emergent LLM
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY")
 
-# JWT
-JWT_SECRET = os.environ["JWT_SECRET"]
-JWT_ALGORITHM = "HS256"
-JWT_EXPIRE_DAYS = int(os.environ.get("JWT_EXPIRE_DAYS", "7"))
-
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
-auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-
-# ---------- Auth helpers ----------
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
-
-def verify_password(plain: str, hashed: str) -> bool:
-    try:
-        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
-    except Exception:
-        return False
-
-
-def create_access_token(user_id: str, email: str) -> str:
-    payload = {
-        "sub": user_id,
-        "email": email,
-        "exp": datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRE_DAYS),
-        "iat": datetime.now(timezone.utc),
-        "type": "access",
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-
-async def get_current_user(request: Request) -> dict:
-    auth_header = request.headers.get("Authorization", "")
-    token: Optional[str] = None
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
-    if not token:
-        token = request.cookies.get("access_token")
-    if not token:
-        raise HTTPException(status_code=401, detail="No autenticado")
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expirado")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Token inválido")
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Token inválido")
-    user = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
-    if not user:
-        raise HTTPException(status_code=401, detail="Usuario no encontrado")
-    return user
-
-
-class RegisterRequest(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=6, max_length=128)
-    name: Optional[str] = None
-
-
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-
-def is_admin(user: dict) -> bool:
-    return user.get("role") == "admin"
-
-
-def needs_scope(user: dict, request: Request) -> bool:
-    """Admin can opt-out of user scoping via ?admin_all=true; everyone else is always scoped."""
-    if is_admin(user) and request.query_params.get("admin_all") == "true":
-        return False
-    return True
-
-
-def user_filter(user: dict, request: Request, extra: Optional[dict] = None) -> dict:
-    f = dict(extra) if extra else {}
-    if needs_scope(user, request):
-        f["user_id"] = user["id"]
-    return f
-
-
-async def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
-    if not is_admin(current_user):
-        raise HTTPException(status_code=403, detail="Acceso solo para administradores")
-    return current_user
 
 # ---------- Models ----------
 class WatchlistStock(BaseModel):
@@ -352,69 +258,6 @@ async def root():
     return {"message": "Stock Tracker API"}
 
 
-# ---------- Auth endpoints ----------
-@auth_router.post("/register")
-async def register(req: RegisterRequest):
-    email = req.email.lower().strip()
-    existing = await db.users.find_one({"email": email})
-    if existing:
-        raise HTTPException(status_code=400, detail="Ese email ya está registrado")
-    user_id = str(uuid.uuid4())
-    doc = {
-        "id": user_id,
-        "email": email,
-        "name": req.name or email.split("@")[0],
-        "password_hash": hash_password(req.password),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.users.insert_one(doc)
-    token = create_access_token(user_id, email)
-    return {
-        "token": token,
-        "user": {"id": user_id, "email": email, "name": doc["name"], "role": "user"},
-    }
-
-
-@auth_router.post("/login")
-async def login(req: LoginRequest, request: Request):
-    email = req.email.lower().strip()
-    ip = request.client.host if request.client else "unknown"
-    key = f"{ip}:{email}"
-
-    # Brute-force: 5 attempts -> 15 min lockout
-    attempt = await db.login_attempts.find_one({"identifier": key})
-    now = datetime.now(timezone.utc)
-    if attempt:
-        locked_until = attempt.get("locked_until")
-        if locked_until and datetime.fromisoformat(locked_until) > now:
-            raise HTTPException(status_code=429, detail="Demasiados intentos. Intenta en unos minutos.")
-
-    user = await db.users.find_one({"email": email})
-    if not user or not verify_password(req.password, user["password_hash"]):
-        fails = (attempt.get("fails", 0) if attempt else 0) + 1
-        update = {"identifier": key, "fails": fails, "last_at": now.isoformat()}
-        if fails >= 5:
-            update["locked_until"] = (now + timedelta(minutes=15)).isoformat()
-            update["fails"] = 0
-        await db.login_attempts.update_one({"identifier": key}, {"$set": update}, upsert=True)
-        raise HTTPException(status_code=401, detail="Credenciales inválidas")
-
-    await db.login_attempts.delete_one({"identifier": key})
-    token = create_access_token(user["id"], user["email"])
-    return {
-        "token": token,
-        "user": {"id": user["id"], "email": user["email"], "name": user.get("name"), "role": user.get("role", "user")},
-    }
-
-
-@auth_router.post("/logout")
-async def logout(current_user: dict = Depends(get_current_user)):
-    return {"ok": True}
-
-
-@auth_router.get("/me")
-async def me(current_user: dict = Depends(get_current_user)):
-    return {"user": {"id": current_user["id"], "email": current_user["email"], "name": current_user.get("name"), "role": current_user.get("role", "user")}}
 
 
 @api_router.get("/exchange-rate")
@@ -1167,41 +1010,57 @@ async def delete_trade(trade_id: str, current_user: dict = Depends(get_current_u
     return {"id": trade_id, "deleted": True}
 
 
-# ---------- Admin endpoints ----------
-@api_router.get("/admin/users")
-async def admin_list_users(admin: dict = Depends(require_admin)):
-    users = await db.users.find({}, {"_id": 0, "password_hash": 0}).sort("created_at", 1).to_list(10000)
-    enriched = []
-    for u in users:
-        uid = u["id"]
-        watchlist = await db.watchlist.count_documents({"user_id": uid})
-        lots = await db.position_lots.count_documents({"user_id": uid})
-        trades = await db.closed_trades.count_documents({"user_id": uid})
-        alerts = await db.alerts.count_documents({"user_id": uid})
-        unread = await db.alerts.count_documents({"user_id": uid, "read": False})
-        enriched.append({
-            **u,
-            "stats": {"watchlist": watchlist, "lots": lots, "trades": trades, "alerts": alerts, "unread_alerts": unread},
-        })
-    return {"users": enriched, "count": len(enriched)}
+@api_router.get("/portfolio/trades/export.csv")
+async def export_trades_csv(request: Request, current_user: dict = Depends(get_current_user)):
+    """Export closed trades as CSV for SAT/contador. Returns text/csv attachment."""
+    from fastapi.responses import StreamingResponse
+    import csv
+    import io
 
+    scope = user_filter(current_user, request)
+    trades = await db.closed_trades.find(scope, {"_id": 0}).sort("sell_date", -1).to_list(10000)
 
-@api_router.delete("/admin/users/{user_id}")
-async def admin_delete_user(user_id: str, admin: dict = Depends(require_admin)):
-    if user_id == admin["id"]:
-        raise HTTPException(status_code=400, detail="No puedes eliminarte a ti mismo")
-    user = await db.users.find_one({"id": user_id})
-    if not user:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
-    # Cascade delete all user data
-    await db.watchlist.delete_many({"user_id": user_id})
-    await db.position_lots.delete_many({"user_id": user_id})
-    await db.position_targets.delete_many({"user_id": user_id})
-    await db.closed_trades.delete_many({"user_id": user_id})
-    await db.alerts.delete_many({"user_id": user_id})
-    await db.predictions.delete_many({"user_id": user_id})
-    await db.users.delete_one({"id": user_id})
-    return {"id": user_id, "deleted": True}
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow([
+        "sell_date", "ticker", "method", "qty_sold",
+        "sell_price_usd", "sell_fx_rate", "proceeds_usd", "proceeds_mxn",
+        "cost_usd", "cost_mxn", "pnl_usd", "pnl_mxn",
+        "return_pct", "avg_days_held", "annualized_return_pct",
+        "lots_consumed",
+    ])
+    for t in trades:
+        lots_desc = "; ".join(
+            f"{a.get('buy_date','')}@${a.get('buy_price_usd',0):.2f} x{a.get('qty',0)}"
+            for a in t.get("allocations", [])
+        )
+        writer.writerow([
+            t.get("sell_date", ""),
+            t.get("ticker", ""),
+            t.get("method", ""),
+            t.get("qty_sold", 0),
+            t.get("sell_price_usd", 0),
+            t.get("sell_fx_rate", 0),
+            t.get("proceeds_usd", 0),
+            t.get("proceeds_mxn", 0),
+            t.get("cost_usd", 0),
+            t.get("cost_mxn", 0),
+            t.get("pnl_usd", 0),
+            t.get("pnl_mxn", 0),
+            t.get("return_pct", 0),
+            t.get("avg_days_held", 0),
+            t.get("annualized_return_pct", "") if t.get("annualized_return_pct") is not None else "",
+            lots_desc,
+        ])
+
+    csv_data = buf.getvalue()
+    filename = f"operaciones-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.csv"
+    return StreamingResponse(
+        iter([csv_data]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 
 
 async def _check_target_crosses() -> int:
@@ -1322,6 +1181,7 @@ async def _on_startup():
 
 
 app.include_router(auth_router)
+app.include_router(admin_router)
 app.include_router(api_router)
 
 app.add_middleware(
@@ -1335,4 +1195,5 @@ app.add_middleware(
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    from deps import mongo_client
+    mongo_client.close()

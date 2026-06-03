@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { LineChart, Line, ResponsiveContainer, XAxis, YAxis, Tooltip, CartesianGrid, Area, AreaChart } from "recharts";
-import { ClockCounterClockwise, TrendUp, TrendDown, Trash, ChartLineUp } from "@phosphor-icons/react";
+import { ClockCounterClockwise, TrendUp, TrendDown, Trash, ChartLineUp, DownloadSimple } from "@phosphor-icons/react";
 import { toast } from "sonner";
-import { api, fmtUSD, fmtMXN, fmtPct, fmtNumber } from "../lib/api";
+import { api, fmtUSD, fmtMXN, fmtPct, fmtNumber, API } from "../lib/api";
 
 export default function ClosedTradesPanel() {
   const [data, setData] = useState(null);
@@ -36,6 +36,26 @@ export default function ClosedTradesPanel() {
       await load();
     } catch (e) {
       toast.error("No se pudo eliminar");
+    }
+  };
+
+  const exportCsv = async () => {
+    try {
+      const adminAll = localStorage.getItem("admin_all") === "1";
+      const url = `${API}/portfolio/trades/export.csv${adminAll ? "?admin_all=true" : ""}`;
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${localStorage.getItem("auth_token") || ""}` },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const link = document.createElement("a");
+      link.href = window.URL.createObjectURL(blob);
+      link.download = `operaciones-${new Date().toISOString().slice(0, 10)}.csv`;
+      link.click();
+      window.URL.revokeObjectURL(link.href);
+      toast.success("CSV descargado");
+    } catch (e) {
+      toast.error("No se pudo exportar", { description: e.message });
     }
   };
 
@@ -89,9 +109,20 @@ export default function ClosedTradesPanel() {
       </div>
 
       {/* Trades list */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
         <h2 className="text-heading text-sm font-medium text-ink-secondary uppercase tracking-widest">Operaciones cerradas</h2>
-        <span className="text-mono text-xs text-ink-muted">{trades.length}</span>
+        <div className="flex items-center gap-3">
+          <span className="text-mono text-xs text-ink-muted">{trades.length}</span>
+          <button
+            type="button"
+            onClick={exportCsv}
+            disabled={trades.length === 0}
+            data-testid="export-csv"
+            className="flex items-center gap-2 text-xs px-3 py-1.5 rounded-md border border-line bg-obsidian-surface text-ink-secondary hover:bg-obsidian-hover hover:text-ink-primary hover:border-line-focus transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <DownloadSimple size={14} weight="bold" /> Exportar CSV
+          </button>
+        </div>
       </div>
 
       {loading ? (

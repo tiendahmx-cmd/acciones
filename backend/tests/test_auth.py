@@ -23,7 +23,7 @@ BASE_URL = os.environ["REACT_APP_BACKEND_URL"].rstrip("/")
 API = f"{BASE_URL}/api"
 
 ADMIN_EMAIL = "admin@stocks.app"
-ADMIN_PASSWORD = "Admin#Stocks2026"
+ADMIN_PASSWORD = "KOsso8032#$+"
 
 
 def _new_email(tag: str) -> str:

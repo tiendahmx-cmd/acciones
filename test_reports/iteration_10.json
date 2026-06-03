@@ -1,0 +1,47 @@
+{
+  "summary": "Iteration 10 backend testing: hardening + CSV export + module refactor. 47/47 backend tests pass (36 regression + 11 new). Admin password successfully updated to KOsso8032#$+ and confirmed working. Module refactor (deps.py / auth_routes.py / admin_routes.py) imports cleanly, backend boots without errors.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_auth.py",
+    "/app/backend/tests/test_iter10.py",
+    "/app/test_reports/pytest/iter10_auth.xml",
+    "/app/test_reports/pytest/iter10_new.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is still 1200 lines — consider extracting portfolio/alerts/quotes routers into their own modules next iteration for parity with auth_routes/admin_routes refactor.",
+    "_check_price_moves() in server.py has subtle indentation drift around the inner _create_alert(...) call (lines 550-558): the message=/payload= kwargs and the trailing `created += 1` are aligned one extra level relative to the outer for-loop. The code still works because Python only cares about consistency of the nested block, but it is misleading and easy to break on the next edit. Re-indent to 16/12 spaces.",
+    "Per-email lockout in auth_routes.login: when (IP,email) check raises 429 first, the per-email fails counter stops incrementing. This means the per-email global lockout (threshold 10) is in practice only reachable when attempts come from distinct IPs — which is the intended behaviour, but worth documenting since pure single-IP brute force will always trip the 5-fail (IP,email) lock first.",
+    "Per-IP register rate-limit uses the same `login_attempts` collection as login lockout — fine functionally but the collection name is now misleading; consider renaming to `auth_attempts` or splitting collections.",
+    "CSV export uses StreamingResponse with iter([csv_data]) — entire CSV is materialised in memory before streaming. Acceptable for current scale (limit 10000) but should switch to true streaming via cursor for larger datasets.",
+    "_alerts_loop uses asyncio.sleep(15) startup delay then 600s loop — no jitter; multiple replicas would synchronise. Low priority while single-instance.",
+    "auth_routes.register: the rate-limit window reset (lines 33-36) only runs when window has expired AND user is within record; the increment on line 52-56 then uses $setOnInsert which won't reset window_start on existing records. After the 1-hour window passes, the reset on line 34 correctly resets count but doesn't reset window_start — relying on the existing field. Verified working in tests."
+  ],
+  "updated_files": [
+    "/app/memory/test_credentials.md (admin password updated to KOsso8032#$+)",
+    "/app/backend/tests/test_auth.py (ADMIN_PASSWORD constant updated)",
+    "/app/backend/tests/test_iter10.py (NEW — 11 tests for iter10 features)"
+  ],
+  "success_rate": {"backend": "100% (47/47)", "frontend": "not tested (backend-only request)"},
+  "test_credentials": "Admin: admin@stocks.app / KOsso8032#$+",
+  "seed_data_creation": "test_iter10.py creates throwaway TEST-iter10-* users; all cleaned up via autouse fixture which also drops login_attempts so manual testing is not blocked.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iter 10 verified. /app/backend/tests/test_auth.py = 36 regression tests, /app/backend/tests/test_iter10.py = 11 new tests covering: backend boot/router mounting after refactor, /api/auth/register per-IP 10/hour rate-limit (11th returns 429), /api/auth/login per-email global lockout (pre-seeded fails=9 + 1 wrong = locked → next attempt 429), /api/portfolio/trades/export.csv (401 without auth, text/csv content-type with attachment Content-Disposition, exact 16-column header validated, user-scoped body, admin ?admin_all=true returns cross-user trades, admin without flag is self-scoped). Both files use module-scope cleanup fixture that drops login_attempts collection and deletes TEST users via admin DELETE — so manual testing post-run is unaffected. Per-email lockout is tested by direct MongoDB seeding of login_attempts (pymongo) because the public ingress URL doesn't allow varying client IP — this is documented in the test.",
+  "iteration_summary": {
+    "tests_added": 11,
+    "tests_regression_passed": "36/36",
+    "tests_iter10_passed": "11/11",
+    "modules_validated": ["deps.py", "auth_routes.py", "admin_routes.py"],
+    "new_endpoints_validated": ["/api/portfolio/trades/export.csv"],
+    "hardening_validated": ["per-IP register rate-limit (10/hour)", "per-(IP,email) lockout (5 fails)", "per-email global lockout (10 fails)"]
+  }
+}
