@@ -1,0 +1,40 @@
+{
+  "summary": "Iteration 8 retest: the iter-7 critical bug on /api/portfolio?admin_all=true (KeyError -> 500) is FIXED — admin admin_all now returns 200 with user_id on every position row, and the legacy ownerless-doc migration ran on startup (9 watchlist + 205 predictions purged per request). The originally failing test test_admin_portfolio_admin_all_cross_user PASSES now. HOWEVER, the fix introduced a REGRESSION: data isolation on /api/portfolio is broken for non-admin users and for admin-scoped (admin_all not set) queries. 3 NEW tests now fail (test_portfolio_lots_isolated, test_non_admin_admin_all_silently_ignored_on_portfolio, test_admin_portfolio_without_admin_all_is_scoped). Root cause: server.py:836 uses `{**scope, 'user_id': {'$exists': True, '$ne': None}}` — the SECOND `user_id` key overwrites the scope's `user_id: <current_user_id>`, so the aggregation matches ALL position_lots regardless of owner. Confirmed with python repl. Net iter8 result: 33/36 PASS (was 34/36 in iter7). The class of failure changed from CRASH (500) to SILENT DATA LEAK — strictly worse.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "GET /api/portfolio (no admin_all OR for non-admin user)",
+        "issue": "DATA ISOLATION BROKEN. server.py:836 `{'$match': {**scope, 'user_id': {'$exists': True, '$ne': None}}}` — the second 'user_id' key in the spread overwrites the per-user scope filter (`scope = {'user_id': current_user['id']}`). Result: any authenticated user gets ALL users' position_lots returned (then user_id is attached to each row in the response). Reproduction: user_a POST /api/portfolio/lots {ticker:AAPL,...}; user_b GET /api/portfolio -> response.positions contains AAPL with user_id=user_a.id. Same for admin GET /api/portfolio (without admin_all=true) which is supposed to be scoped to admin's own portfolio. Fix (one line): `match = dict(scope); match.setdefault('user_id', {'$exists': True, '$ne': None}); pipeline = [{'$match': match}, ...]` — i.e., only add the existence guard when scope did NOT already pin user_id (admin_all path).",
+        "priority": "CRITICAL"
+      }
+    ],
+    "minor": [
+      {"endpoint": "/api/portfolio/lots/{ticker}", "issue": "Same anti-pattern risk: lots endpoint uses user_filter(... , {'ticker': ticker}) which is fine today, but if a future patch adds a user_id existence check via dict-spread it will repeat this bug. Consider centralising the 'add ownerless guard' into user_filter itself (only when scope has no user_id)."},
+      {"endpoint": "seed_admin (server.py ~1284-1298)", "issue": "Still does not update password_hash when ADMIN_PASSWORD in .env changes (carry-over from iter7). Auth-playbook contract requires updating existing admin password on env change. Iter8 retest did not exercise this (admin password unchanged), but the code is unchanged."},
+      {"endpoint": "Startup migration", "issue": "Migration deletes ownerless docs at every startup. Purge already ran (per main agent: 9 watchlist + 205 predictions). Consider gating with a one-shot flag in a meta collection so restarts don't always re-scan every per-user collection."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_auth.py",
+    "/app/test_reports/pytest/iter8_auth.xml"
+  ],
+  "action_items": [
+    "FIX (critical, one-line): server.py:835-838. Replace `{'$match': {**scope, 'user_id': {'$exists': True, '$ne': None}}}` with logic that ONLY adds the existence guard when scope does not already contain user_id. Suggested patch:\n    match = dict(scope)\n    match.setdefault('user_id', {'$exists': True, '$ne': None})\n    pipeline = [{'$match': match}, {'$group': {...}}]\nThis preserves per-user scope AND still excludes ownerless docs in admin_all mode.",
+    "After fix, re-run pytest backend/tests/test_auth.py — all 36 tests should pass.",
+    "Audit the rest of the codebase for the same dict-spread-overwrite pattern (any `{**scope, 'user_id': ...}` or `{**user_filter(...), 'user_id': ...}`)."
+  ],
+  "critical_code_review_comments": [
+    "server.py:836 — dict spread anti-pattern silently overwrites the scope. This converted a CRASH (iter7, 500) into a SILENT DATA LEAK (iter8, 200 with foreign rows) — a far more dangerous failure mode. Any future scope filter merge MUST use $and or explicit setdefault to be safe.",
+    "Repeat: server.py is now 1336 lines — splitting into modules (auth, portfolio, alerts, admin) would make these pipeline merges much harder to get wrong.",
+    "Test gap: test_auth.py::TestAdmin::test_admin_portfolio_admin_all_cross_user PASSED in iter8 only because admin_all path uses scope={} (no collision). The 'all 36 tests pass' narrative on the next fix MUST come from a clean run of EVERY isolation test, not just the originally-failing one — iter7 missed this because the bug only manifests when there exist cross-user lots AND a non-admin (or scoped admin) queries /portfolio."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "92% (33/36 auth tests; original 2 iter7-failures now pass, but 3 new regressions appeared)", "frontend": "N/A (backend-only)"},
+  "test_credentials": "Admin: admin@stocks.app / Admin#Stocks2026 (auto-seeded). Test users created on demand: TEST-{tag}-{uuid}@stocks.app / passw0rd!.",
+  "seed_data_creation": "test_auth.py creates throwaway users (TEST-A-*, TEST-B-*, TEST-reg-*, TEST-bf-*, TEST-del-*); user_a is given an AAPL position_lot. Module-scope cleanup fixture deletes TEST- users via /api/admin/users/{id} which cascades watchlist/lots/targets/trades/alerts/predictions.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Iter8 retest result: original iter7 bug (500 on admin_all=true) is fixed, but the same diff introduced a CRITICAL data-isolation regression on /api/portfolio caused by dict-spread overwrite at server.py:836. Three new failures (test_portfolio_lots_isolated, test_non_admin_admin_all_silently_ignored_on_portfolio, test_admin_portfolio_without_admin_all_is_scoped) share this one root cause. After main agent patches the $match builder, re-run only test_auth.py to verify all 36 pass. No other regressions observed; brute-force lockout, admin user-delete cascade, /me, /admin/users, alerts admin_all all still pass.",
+  "rca of the issue": "RCA: in server.py get_portfolio (lines 832-839), the new $match stage is built as `{**scope, 'user_id': {'$exists': True, '$ne': None}}`. Python dict-literal merge keeps the LAST value for duplicate keys, so when scope already contains `'user_id': '<current_user_id>'` (the normal case for non-admin users and for admin without admin_all=true), it gets silently replaced by the existence guard. The pipeline then matches ALL lots in the DB; the response wraps each one with `pos['user_id'] = uid`, leaking other users' positions to the caller. Reproduction: (1) login as user_a, POST /api/portfolio/lots {ticker:AAPL,qty:5,buy_price_usd:150,buy_date:'2024-01-01'}, (2) login as user_b, GET /api/portfolio -> 200 with positions including {ticker:'AAPL', user_id:'<user_a_id>',...}. Mitigation (one-line): build match dict and use setdefault so the existence guard only applies when scope didn't already pin user_id. Concretely:\n    match = dict(scope)\n    match.setdefault('user_id', {'$exists': True, '$ne': None})\n    pipeline = [{'$match': match}, {'$group': {'_id': {'user_id': '$user_id', 'ticker': '$ticker'}}}]\nVerification: confirmed via python REPL that `{**{'user_id': 'X'}, 'user_id': {'$exists': True}}` evaluates to `{'user_id': {'$exists': True}}` (scope lost)."
+}

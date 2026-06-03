@@ -831,8 +831,11 @@ async def _aggregate_position(user_id: str, ticker: str, mxn_rate: float, curren
 @api_router.get("/portfolio")
 async def get_portfolio(request: Request, current_user: dict = Depends(get_current_user)):
     scope = user_filter(current_user, request)
-    # We aggregate per (user_id, ticker) so admin in admin_all sees one row per user.
-    pipeline = [{"$match": scope}, {"$group": {"_id": {"user_id": "$user_id", "ticker": "$ticker"}}}]
+    # Aggregate per (user_id, ticker). Skip ownerless legacy docs just in case.
+    pipeline = [
+        {"$match": {**scope, "user_id": {"$exists": True, "$ne": None}}},
+        {"$group": {"_id": {"user_id": "$user_id", "ticker": "$ticker"}}},
+    ]
     pairs = await db.position_lots.aggregate(pipeline).to_list(10000)
     mxn_rate = await get_usd_mxn_rate()
     if not pairs:
@@ -853,8 +856,10 @@ async def get_portfolio(request: Request, current_user: dict = Depends(get_curre
 
     positions = []
     for p in pairs:
-        uid = p["_id"]["user_id"]
-        t = p["_id"]["ticker"]
+        uid = p["_id"].get("user_id")
+        t = p["_id"].get("ticker")
+        if not uid or not t:
+            continue
         pos = await _aggregate_position(uid, t, mxn_rate, prices.get(t))
         if pos:
             pos["user_id"] = uid
@@ -1278,24 +1283,38 @@ async def _alerts_loop():
 async def _on_startup():
     await db.users.create_index("email", unique=True)
     await db.login_attempts.create_index("identifier")
-    # Seed admin from env (idempotent — only inserts if missing)
+
+    # One-shot migration: delete ownerless documents from per-user collections (pre-auth legacy).
+    for col_name in ("watchlist", "position_lots", "position_targets", "closed_trades", "alerts", "predictions"):
+        col = db[col_name]
+        res = await col.delete_many({"$or": [{"user_id": {"$exists": False}}, {"user_id": None}]})
+        if res.deleted_count:
+            logger.info(f"Migration: deleted {res.deleted_count} ownerless docs from {col_name}")
+
+    # Seed/upgrade admin from env (password also syncs if .env changes)
     admin_email = os.environ.get("ADMIN_EMAIL")
     admin_password = os.environ.get("ADMIN_PASSWORD")
     if admin_email and admin_password:
-        existing = await db.users.find_one({"email": admin_email.lower().strip()})
+        email_norm = admin_email.lower().strip()
+        existing = await db.users.find_one({"email": email_norm})
         if not existing:
             await db.users.insert_one({
                 "id": str(uuid.uuid4()),
-                "email": admin_email.lower().strip(),
+                "email": email_norm,
                 "name": "Administrator",
                 "password_hash": hash_password(admin_password),
                 "role": "admin",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             })
             logger.info(f"Seeded admin user: {admin_email}")
-        elif existing.get("role") != "admin":
-            await db.users.update_one({"id": existing["id"]}, {"$set": {"role": "admin"}})
-            logger.info(f"Promoted existing user to admin: {admin_email}")
+        else:
+            update = {"role": "admin"}
+            # Sync password if .env has been changed
+            if not verify_password(admin_password, existing.get("password_hash", "")):
+                update["password_hash"] = hash_password(admin_password)
+                logger.info("Admin password synced from .env")
+            await db.users.update_one({"id": existing["id"]}, {"$set": update})
+
     asyncio.create_task(_alerts_loop())
 
 
