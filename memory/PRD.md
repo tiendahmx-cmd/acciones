@@ -62,6 +62,16 @@ Web app with elegant dark UX/UI displaying real-time NASDAQ/NYSE quotes (INTC, S
 - Frontend: tercer tab **Historial** con summary tiles, equity curve mensual (recharts AreaChart con punto mensual), tabla de trades con anualizado. Botón "Vender" en cada PositionCard abre `SellPositionDialog` con selector de método y proyección de P&L en vivo.
 - 69/69 backend tests pass (iter 6).
 
+### Iteration 7–9 (Auth JWT + Admin role)
+- **JWT auth** (bcrypt + Bearer tokens, 7d): `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me`. Brute-force protection (5 fails → 15min lockout per IP+email).
+- **Admin role**: seeded automáticamente desde `ADMIN_EMAIL` / `ADMIN_PASSWORD` en .env. Password sync si el .env cambia.
+- **Data isolation**: TODOS los endpoints existentes ahora requieren auth y filtran por `user_id`. Watchlist, portfolio, lots, targets, trades, alerts, predictions privados por usuario.
+- **Vista global admin**: query param `?admin_all=true` desactiva el filtro por user_id (sólo válido si rol=admin; no-admins lo reciben silenciosamente ignorado).
+- **Endpoints admin**: `GET /api/admin/users` (listado con stats: watchlist, lots, trades, alerts, unread), `DELETE /api/admin/users/{id}` (cascade delete de todo el contenido del usuario; admin no puede eliminarse a sí mismo).
+- **Frontend**: Login/Register pages, `AuthContext` con localStorage, axios interceptor (Bearer + admin_all flag automático), `ProtectedRoute`/`AdminRoute`, `UserMenu` con badge admin + toggle "Vista global" + acceso a `/admin/users`, página AdminUsersPage con tabla de usuarios.
+- **Migration**: limpieza one-shot de docs ownerless al startup (purgó 9 watchlist + 205 predictions del estado de desarrollo previo).
+- **36/36 tests pass** (iter 9 — corregidos 2 bugs encontrados durante el ciclo: crash KeyError en admin_all y regresión de aislamiento por overwrite de spread `{**scope, user_id: ...}`).
+
 ## Backlog (P1)
 - Sparkline chart on each card (recharts).
 - Push notifications when prediction direction flips.
