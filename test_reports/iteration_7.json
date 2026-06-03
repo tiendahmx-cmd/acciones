@@ -1,0 +1,43 @@
+{
+  "summary": "Iteration 7: JWT auth + admin role + data isolation tested via new /app/backend/tests/test_auth.py (36 tests, 34 PASS / 2 FAIL). All auth basics, brute-force lockout (5 fails -> 429), protected-endpoint 401 wall (11 routes), admin seeding, /me, /auth/me without/with bad token, register validation (422 for password<6 / 400 for duplicate), per-user watchlist seeding, watchlist/portfolio/alerts data isolation between two fresh users, non-admin admin_all silently ignored, admin /admin/users list with stats (no _id/password_hash leak), admin self-delete blocked (400), admin delete-nonexistent 404, admin alerts admin_all — ALL PASS. The 2 failures both root-cause to one bug: legacy orphan documents in DB (created before iter-7 migration) lack the new `user_id` field, and admin /portfolio?admin_all=true crashes with KeyError: 'user_id' at server.py:856. This is also a latent data-leak/correctness issue: 9 lots, 3 targets, 4 closed_trades, 12 alerts, 215 predictions, 9 watchlist rows are 'ownerless' in the DB and silently invisible to all users — they only surface (and crash) under admin_all.",
+  "backend_issues": {
+    "critical": [
+      {"endpoint": "GET /api/portfolio?admin_all=true", "issue": "500 KeyError: 'user_id' at server.py:856. The aggregation pipeline `{$group: {_id: {user_id: '$user_id', ticker: '$ticker'}}}` returns rows where _id.user_id is null for legacy lots that predate the auth migration. Then `uid = p['_id']['user_id']` may be missing/null, and the subsequent `_aggregate_position(uid=None, ...)` cascades. Fix: either backfill user_id on startup migration, or skip pipeline rows where `_id.user_id is None` in get_portfolio.", "priority": "CRITICAL"}
+    ],
+    "minor": [
+      {"endpoint": "Multiple collections", "issue": "Orphan documents without user_id present in DB (lots=9, targets=3, closed_trades=4, alerts=12, predictions=215, watchlist=9). They are silently invisible to all regular users (good for isolation) but: (a) crash admin_all on /portfolio, (b) inflate admin storage/list counts unpredictably, (c) violate the 'every record is owned' invariant. Add a one-time migration on startup that deletes or reassigns them."},
+      {"endpoint": "POST /api/auth/logout", "issue": "Returns {ok:true} but does not invalidate the JWT (no server-side blacklist). Since tokens are stateless and valid 7 days, true logout is impossible without revocation list or shorter TTL + refresh. Acceptable for an MVP but document or implement a revoked-jti list."},
+      {"endpoint": "POST /api/auth/login", "issue": "Brute-force key is `{ip}:{email}` which means an attacker behind shared NAT (single IP) is locked out by trying any user; conversely an attacker can rotate IPs to bypass. Consider per-email lockout in addition to per-IP."},
+      {"endpoint": "POST /api/auth/register", "issue": "No rate limit. An attacker can enumerate emails or spam-create accounts. Add per-IP throttling."},
+      {"endpoint": "GET /api/auth/me", "issue": "Returns Spanish error messages ('No autenticado', 'Token expirado') while other endpoints use English ('Not in watchlist'). Pick one locale."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_auth.py",
+    "/app/test_reports/pytest/iter7_auth.xml"
+  ],
+  "action_items": [
+    "FIX (critical): Backfill or skip legacy ownerless docs so /api/portfolio?admin_all=true does not 500. Recommended: in @app.on_event('startup'), run `await db.position_lots.delete_many({'user_id': {'$exists': False}})` (and same for watchlist, position_targets, closed_trades, alerts, predictions, ticker_state-by-association). Or guard server.py:856 with `if not uid: continue`.",
+    "Update the existing test files (test_portfolio.py, test_trades.py, test_alerts.py, backend_test.py) to authenticate via a module-scope fixture that registers a TEST_ user and injects Authorization: Bearer header — all 61 prior-iter tests now correctly receive 401. They are not broken; they are unmigrated. Consider a shared conftest.py with `authenticated_client` fixture.",
+    "Consider splitting server.py (now 1316 lines) — auth_router, admin_router, portfolio module, trades module, alerts module. Repeated from iter 5/6 comments.",
+    "Add per-email brute-force lockout in addition to per-IP+email.",
+    "Add rate limit on /api/auth/register."
+  ],
+  "critical_code_review_comments": [
+    "server.py:856 — `uid = p['_id']['user_id']` has no None/missing guard. Crash surface for any legacy data; fix is one line.",
+    "server.py:1284-1298 — seed_admin is idempotent on insert AND promotes existing user to admin role, but does NOT update password_hash if ADMIN_PASSWORD changes in .env. Auth-playbook contract requires updating password on env change. Add `update_one({...},{'$set':{'password_hash': hash_password(admin_password), 'role':'admin'}})` when existing.",
+    "JWT_SECRET is committed in /app/backend/.env. For preview env this is fine; flag for prod.",
+    "CORS_ORIGINS='*' combined with allow_credentials=True is silently downgraded by Starlette (browsers ignore wildcard with credentials). If cookie-based auth is intended, set explicit origins. Bearer-header flow used here works either way.",
+    "login.py path issues 401 with detail 'Credenciales inválidas' even when account is locked but credentials are correct on first wrong-password attempt — order of checks is correct (lockout first), but on 5th failed attempt the response is still 401 then NEXT request is 429. Consider returning 429 on the 5th attempt itself for clearer UX.",
+    "get_current_user issues 401 'Usuario no encontrado' if user was deleted but token still valid — correct, but logs no audit trail."
+  ],
+  "updated_files": ["/app/backend/tests/test_auth.py"],
+  "success_rate": {"backend": "94% (34/36 auth tests; 2 failures share one root cause — legacy data without user_id)", "frontend": "N/A (backend-only)"},
+  "test_credentials": "Admin: admin@stocks.app / Admin#Stocks2026 (auto-seeded from /app/backend/.env). Test users dynamically created with TEST-{tag}-{uuid}@stocks.app + password 'passw0rd!'.",
+  "seed_data_creation": "test_auth.py creates 2-4 throwaway users per run via /api/auth/register (TEST-A-*, TEST-B-*, TEST-reg-*, TEST-bf-*, TEST-del-*). user_a is given an AAPL lot for isolation/admin_all checks. Module-scope cleanup fixture attempts to delete TEST- users via admin endpoint (cascades watchlist, lots, targets, trades, alerts, predictions).",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Iteration 7 introduces JWT auth on top of the iter-6 base. NEW canonical regression file is /app/backend/tests/test_auth.py (36 tests). PRIOR test files (test_portfolio.py, test_trades.py, test_alerts.py, backend_test.py) all 401-fail under the new auth wall — they need a conftest.py with an authenticated_client fixture before they can be revived; until then, treat test_auth.py as the only meaningful regression. Open known issue: legacy ownerless docs in DB (lots=9, targets=3, trades=4, alerts=12, predictions=215, watchlist=9) cause /api/portfolio?admin_all=true to 500. Once main agent purges/migrates them, re-run pytest backend/tests/test_auth.py and the 2 failures should pass. Admin password change in .env will NOT propagate to DB without a code fix in seed_admin.",
+  "rca of the issue": "Root cause: in get_portfolio (server.py:831-883), when admin sends admin_all=true the scope filter becomes empty `{}` and the aggregation `{$group: {_id: {user_id: '$user_id', ticker: '$ticker'}}}` matches ALL position_lots — including 9 documents created before iteration 7 that never had a user_id field. MongoDB sets _id.user_id to null/missing for those rows, then Python at line 856 dereferences `p['_id']['user_id']` and throws KeyError (when missing) or passes None (when null) into _aggregate_position which queries with {'user_id': None} and returns None, dropping the row but only after a wasted fetch. Reproduction: (1) login as admin, (2) GET /api/portfolio?admin_all=true → 500. Mitigation options: (A) one-shot migration in @app.on_event('startup'): `await db.position_lots.delete_many({'user_id': {'$exists': False}})` etc for every per-user collection; (B) defensive `uid = p['_id'].get('user_id'); if not uid: continue` at server.py:856; (C) add `{'$match': {'user_id': {'$exists': True, '$ne': None}}}` as the first pipeline stage in get_portfolio. Recommend (A)+(C) for both data hygiene and safety."
+}

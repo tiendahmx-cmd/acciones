@@ -10,6 +10,7 @@ import TopMoversDialog from "../components/TopMoversDialog";
 import AlertsBell from "../components/AlertsBell";
 import PortfolioPanel from "../components/PortfolioPanel";
 import ClosedTradesPanel from "../components/ClosedTradesPanel";
+import UserMenu from "../components/UserMenu";
 import { Button } from "../components/ui/button";
 
 export default function Dashboard() {
@@ -106,6 +107,7 @@ export default function Dashboard() {
               </span>
             </div>
             <AlertsBell onAlertClick={(t) => setSelectedTicker(t)} />
+            <UserMenu />
             <Button
               variant="outline"
               size="sm"

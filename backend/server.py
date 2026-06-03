@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -9,13 +9,15 @@ import json
 import re
 import uuid
 from pathlib import Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 
 import requests
 import yfinance as yf
 import math
+import bcrypt
+import jwt
 
 
 def _clean_float(v):
@@ -41,11 +43,99 @@ db = client[os.environ["DB_NAME"]]
 # Emergent LLM
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY")
 
+# JWT
+JWT_SECRET = os.environ["JWT_SECRET"]
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_DAYS = int(os.environ.get("JWT_EXPIRE_DAYS", "7"))
+
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
+auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+# ---------- Auth helpers ----------
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def create_access_token(user_id: str, email: str) -> str:
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "exp": datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRE_DAYS),
+        "iat": datetime.now(timezone.utc),
+        "type": "access",
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+async def get_current_user(request: Request) -> dict:
+    auth_header = request.headers.get("Authorization", "")
+    token: Optional[str] = None
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+    if not token:
+        token = request.cookies.get("access_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="No autenticado")
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expirado")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+    if not user:
+        raise HTTPException(status_code=401, detail="Usuario no encontrado")
+    return user
+
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6, max_length=128)
+    name: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+def is_admin(user: dict) -> bool:
+    return user.get("role") == "admin"
+
+
+def needs_scope(user: dict, request: Request) -> bool:
+    """Admin can opt-out of user scoping via ?admin_all=true; everyone else is always scoped."""
+    if is_admin(user) and request.query_params.get("admin_all") == "true":
+        return False
+    return True
+
+
+def user_filter(user: dict, request: Request, extra: Optional[dict] = None) -> dict:
+    f = dict(extra) if extra else {}
+    if needs_scope(user, request):
+        f["user_id"] = user["id"]
+    return f
+
+
+async def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Acceso solo para administradores")
+    return current_user
 
 # ---------- Models ----------
 class WatchlistStock(BaseModel):
@@ -248,10 +338,11 @@ def _fetch_history_sync(ticker: str) -> List[dict]:
     return rows
 
 
-async def ensure_default_watchlist():
-    count = await db.watchlist.count_documents({})
+async def ensure_default_watchlist(user_id: str):
+    count = await db.watchlist.count_documents({"user_id": user_id})
     if count == 0:
-        docs = [{"ticker": t, "added_at": datetime.now(timezone.utc).isoformat()} for t in DEFAULT_TICKERS]
+        now = datetime.now(timezone.utc).isoformat()
+        docs = [{"user_id": user_id, "ticker": t, "added_at": now} for t in DEFAULT_TICKERS]
         await db.watchlist.insert_many(docs)
 
 
@@ -261,6 +352,71 @@ async def root():
     return {"message": "Stock Tracker API"}
 
 
+# ---------- Auth endpoints ----------
+@auth_router.post("/register")
+async def register(req: RegisterRequest):
+    email = req.email.lower().strip()
+    existing = await db.users.find_one({"email": email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Ese email ya está registrado")
+    user_id = str(uuid.uuid4())
+    doc = {
+        "id": user_id,
+        "email": email,
+        "name": req.name or email.split("@")[0],
+        "password_hash": hash_password(req.password),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.users.insert_one(doc)
+    token = create_access_token(user_id, email)
+    return {
+        "token": token,
+        "user": {"id": user_id, "email": email, "name": doc["name"], "role": "user"},
+    }
+
+
+@auth_router.post("/login")
+async def login(req: LoginRequest, request: Request):
+    email = req.email.lower().strip()
+    ip = request.client.host if request.client else "unknown"
+    key = f"{ip}:{email}"
+
+    # Brute-force: 5 attempts -> 15 min lockout
+    attempt = await db.login_attempts.find_one({"identifier": key})
+    now = datetime.now(timezone.utc)
+    if attempt:
+        locked_until = attempt.get("locked_until")
+        if locked_until and datetime.fromisoformat(locked_until) > now:
+            raise HTTPException(status_code=429, detail="Demasiados intentos. Intenta en unos minutos.")
+
+    user = await db.users.find_one({"email": email})
+    if not user or not verify_password(req.password, user["password_hash"]):
+        fails = (attempt.get("fails", 0) if attempt else 0) + 1
+        update = {"identifier": key, "fails": fails, "last_at": now.isoformat()}
+        if fails >= 5:
+            update["locked_until"] = (now + timedelta(minutes=15)).isoformat()
+            update["fails"] = 0
+        await db.login_attempts.update_one({"identifier": key}, {"$set": update}, upsert=True)
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+
+    await db.login_attempts.delete_one({"identifier": key})
+    token = create_access_token(user["id"], user["email"])
+    return {
+        "token": token,
+        "user": {"id": user["id"], "email": user["email"], "name": user.get("name"), "role": user.get("role", "user")},
+    }
+
+
+@auth_router.post("/logout")
+async def logout(current_user: dict = Depends(get_current_user)):
+    return {"ok": True}
+
+
+@auth_router.get("/me")
+async def me(current_user: dict = Depends(get_current_user)):
+    return {"user": {"id": current_user["id"], "email": current_user["email"], "name": current_user.get("name"), "role": current_user.get("role", "user")}}
+
+
 @api_router.get("/exchange-rate")
 async def exchange_rate():
     rate = await get_usd_mxn_rate()
@@ -268,14 +424,14 @@ async def exchange_rate():
 
 
 @api_router.get("/watchlist")
-async def get_watchlist():
-    await ensure_default_watchlist()
-    items = await db.watchlist.find({}, {"_id": 0}).sort("added_at", 1).to_list(500)
+async def get_watchlist(current_user: dict = Depends(get_current_user)):
+    await ensure_default_watchlist(current_user["id"])
+    items = await db.watchlist.find({"user_id": current_user["id"]}, {"_id": 0}).sort("added_at", 1).to_list(500)
     return {"tickers": [it["ticker"] for it in items]}
 
 
 @api_router.post("/watchlist")
-async def add_to_watchlist(req: AddStockRequest):
+async def add_to_watchlist(req: AddStockRequest, current_user: dict = Depends(get_current_user)):
     ticker = req.ticker.strip().upper()
     if not ticker or not re.match(r"^[A-Z0-9.\-]{1,10}$", ticker):
         raise HTTPException(status_code=400, detail="Invalid ticker")
@@ -285,29 +441,29 @@ async def add_to_watchlist(req: AddStockRequest):
         await fetch_quote(ticker, rate)
     except HTTPException as e:
         raise HTTPException(status_code=404, detail=f"Ticker {ticker} not found")
-    existing = await db.watchlist.find_one({"ticker": ticker})
+    existing = await db.watchlist.find_one({"user_id": current_user["id"], "ticker": ticker})
     if existing:
         return {"ticker": ticker, "status": "exists"}
-    await db.watchlist.insert_one({"ticker": ticker, "added_at": datetime.now(timezone.utc).isoformat()})
+    await db.watchlist.insert_one({"user_id": current_user["id"], "ticker": ticker, "added_at": datetime.now(timezone.utc).isoformat()})
     return {"ticker": ticker, "status": "added"}
 
 
 @api_router.delete("/watchlist/{ticker}")
-async def remove_from_watchlist(ticker: str):
+async def remove_from_watchlist(ticker: str, current_user: dict = Depends(get_current_user)):
     ticker = ticker.strip().upper()
-    res = await db.watchlist.delete_one({"ticker": ticker})
+    res = await db.watchlist.delete_one({"user_id": current_user["id"], "ticker": ticker})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Not in watchlist")
     return {"ticker": ticker, "status": "removed"}
 
 
 @api_router.get("/quotes")
-async def quotes(tickers: Optional[str] = None):
-    await ensure_default_watchlist()
+async def quotes(tickers: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    await ensure_default_watchlist(current_user["id"])
     if tickers:
         ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     else:
-        items = await db.watchlist.find({}, {"_id": 0}).sort("added_at", 1).to_list(500)
+        items = await db.watchlist.find({"user_id": current_user["id"]}, {"_id": 0}).sort("added_at", 1).to_list(500)
         ticker_list = [it["ticker"] for it in items]
 
     mxn_rate = await get_usd_mxn_rate()
@@ -328,14 +484,14 @@ async def quotes(tickers: Optional[str] = None):
 
 
 @api_router.get("/quote/{ticker}")
-async def single_quote(ticker: str):
+async def single_quote(ticker: str, current_user: dict = Depends(get_current_user)):
     mxn_rate = await get_usd_mxn_rate()
     q = await fetch_quote(ticker.upper(), mxn_rate)
     return {"mxn_rate": mxn_rate, "quote": q.model_dump()}
 
 
 @api_router.get("/history/{ticker}")
-async def history(ticker: str):
+async def history(ticker: str, current_user: dict = Depends(get_current_user)):
     rows = await asyncio.to_thread(_fetch_history_sync, ticker.upper())
     if not rows:
         raise HTTPException(status_code=404, detail="No history available")
@@ -343,14 +499,14 @@ async def history(ticker: str):
 
 
 @api_router.post("/predict/{ticker}")
-async def predict(ticker: str, force: bool = False):
+async def predict(ticker: str, request: Request, force: bool = False, current_user: dict = Depends(get_current_user)):
     ticker = ticker.upper()
 
     # Cache: reuse prediction generated within the last hour unless force=True
     if not force:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         cached = await db.predictions.find_one(
-            {"ticker": ticker, "generated_at": {"$gte": cutoff}},
+            {"user_id": current_user["id"], "ticker": ticker, "generated_at": {"$gte": cutoff}},
             {"_id": 0, "_pkey": 0},
             sort=[("generated_at", -1)],
         )
@@ -435,14 +591,15 @@ async def predict(ticker: str, force: bool = False):
 
     # Check for direction flip vs the previous stored prediction
     prev = await db.predictions.find_one(
-        {"ticker": ticker},
+        {"user_id": current_user["id"], "ticker": ticker},
         {"_id": 0, "direction": 1, "generated_at": 1, "prediction_price": 1},
         sort=[("generated_at", -1)],
     )
-    await db.predictions.insert_one({**doc, "_pkey": f"{ticker}-{doc['generated_at']}"})
+    await db.predictions.insert_one({**doc, "user_id": current_user["id"], "_pkey": f"{current_user['id']}-{ticker}-{doc['generated_at']}"})
 
     if prev and prev.get("direction") and prev["direction"] != result.direction and result.direction in ("up", "down") and prev["direction"] in ("up", "down"):
         await _create_alert(
+            user_id=current_user["id"],
             ticker=ticker,
             atype="direction_flip",
             message=f"AI direction flipped {prev['direction'].upper()} → {result.direction.upper()} ({result.confidence} confidence)",
@@ -459,7 +616,7 @@ async def predict(ticker: str, force: bool = False):
 
 
 @api_router.get("/compare")
-async def compare(tickers: str):
+async def compare(tickers: str, current_user: dict = Depends(get_current_user)):
     """Compare 2+ tickers' 30d normalized close (base 100)."""
     ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     if len(ticker_list) < 2:
@@ -504,9 +661,10 @@ async def compare(tickers: str):
 PRICE_MOVE_THRESHOLD = 3.0  # percent
 
 
-async def _create_alert(ticker: str, atype: str, message: str, payload: dict | None = None) -> dict:
+async def _create_alert(ticker: str, atype: str, message: str, payload: dict | None = None, user_id: Optional[str] = None) -> dict:
     doc = {
         "id": str(uuid.uuid4()),
+        "user_id": user_id,
         "ticker": ticker.upper(),
         "type": atype,
         "message": message,
@@ -519,14 +677,15 @@ async def _create_alert(ticker: str, atype: str, message: str, payload: dict | N
 
 
 async def _check_price_moves(threshold: float = PRICE_MOVE_THRESHOLD) -> int:
-    """Compare each watchlist ticker against last stored ticker_state price; alert if abs(move) >= threshold."""
-    items = await db.watchlist.find({}, {"_id": 0}).to_list(500)
-    tickers = [it["ticker"] for it in items]
-    if not tickers:
+    """For every (user_id, ticker) in watchlists, compare current price vs ticker_state.last_price;
+    alert that user if abs(move) >= threshold. ticker_state is global (shared) since the price is shared.
+    """
+    distinct_tickers = await db.watchlist.distinct("ticker")
+    if not distinct_tickers:
         return 0
     mxn_rate = await get_usd_mxn_rate()
     created = 0
-    for t in tickers:
+    for t in distinct_tickers:
         try:
             q = await fetch_quote(t, mxn_rate)
         except Exception as e:
@@ -538,9 +697,13 @@ async def _check_price_moves(threshold: float = PRICE_MOVE_THRESHOLD) -> int:
             move = ((q.price - prev_price) / prev_price) * 100
             if abs(move) >= threshold:
                 direction = "up" if move > 0 else "down"
-                await _create_alert(
-                    ticker=t,
-                    atype="price_move",
+                # Find every user that holds this ticker in their watchlist
+                watchers = await db.watchlist.find({"ticker": t}, {"_id": 0, "user_id": 1}).to_list(10000)
+                for w in watchers:
+                    await _create_alert(
+                        user_id=w["user_id"],
+                        ticker=t,
+                        atype="price_move",
                     message=f"{t} {direction} {move:+.2f}% to ${q.price:.2f}",
                     payload={
                         "from_price": prev_price,
@@ -549,7 +712,7 @@ async def _check_price_moves(threshold: float = PRICE_MOVE_THRESHOLD) -> int:
                         "direction": direction,
                     },
                 )
-                created += 1
+                    created += 1
         await db.ticker_state.update_one(
             {"ticker": t},
             {"$set": {"last_price": q.price, "updated_at": datetime.now(timezone.utc).isoformat()}},
@@ -559,15 +722,18 @@ async def _check_price_moves(threshold: float = PRICE_MOVE_THRESHOLD) -> int:
 
 
 @api_router.get("/alerts")
-async def list_alerts(unread_only: bool = False, limit: int = 50):
-    query = {"read": False} if unread_only else {}
-    items = await db.alerts.find(query, {"_id": 0}).sort("created_at", -1).to_list(limit)
-    unread = await db.alerts.count_documents({"read": False})
-    return {"alerts": items, "unread": unread, "total": await db.alerts.count_documents({})}
+async def list_alerts(request: Request, unread_only: bool = False, limit: int = 50, current_user: dict = Depends(get_current_user)):
+    base = {"read": False} if unread_only else {}
+    q = user_filter(current_user, request, base)
+    items = await db.alerts.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    scope = user_filter(current_user, request)
+    unread = await db.alerts.count_documents({**scope, "read": False})
+    total = await db.alerts.count_documents(scope)
+    return {"alerts": items, "unread": unread, "total": total}
 
 
 @api_router.post("/alerts/sync")
-async def sync_alerts():
+async def sync_alerts(current_user: dict = Depends(get_current_user)):
     # IMPORTANT: target/stop-loss check MUST run before price-move check,
     # because the latter overwrites ticker_state.last_price.
     target_created = await _check_target_crosses()
@@ -576,29 +742,32 @@ async def sync_alerts():
 
 
 @api_router.post("/alerts/{alert_id}/read")
-async def mark_alert_read(alert_id: str):
-    res = await db.alerts.update_one({"id": alert_id}, {"$set": {"read": True}})
+async def mark_alert_read(alert_id: str, current_user: dict = Depends(get_current_user)):
+    q = {"id": alert_id} if is_admin(current_user) else {"id": alert_id, "user_id": current_user["id"]}
+    res = await db.alerts.update_one(q, {"$set": {"read": True}})
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Alert not found")
     return {"id": alert_id, "read": True}
 
 
 @api_router.post("/alerts/read-all")
-async def mark_all_read():
-    res = await db.alerts.update_many({"read": False}, {"$set": {"read": True}})
+async def mark_all_read(request: Request, current_user: dict = Depends(get_current_user)):
+    q = user_filter(current_user, request, {"read": False})
+    res = await db.alerts.update_many(q, {"$set": {"read": True}})
     return {"updated": res.modified_count}
 
 
 @api_router.delete("/alerts")
-async def clear_alerts():
-    res = await db.alerts.delete_many({})
+async def clear_alerts(request: Request, current_user: dict = Depends(get_current_user)):
+    q = user_filter(current_user, request)
+    res = await db.alerts.delete_many(q)
     return {"deleted": res.deleted_count}
 
 
 # ---------- Portfolio (positions, lots, targets) ----------
-async def _aggregate_position(ticker: str, mxn_rate: float, current_price: Optional[float]):
-    """Compute aggregated position metrics for a ticker."""
-    lots = await db.position_lots.find({"ticker": ticker}, {"_id": 0}).sort("buy_date", 1).to_list(1000)
+async def _aggregate_position(user_id: str, ticker: str, mxn_rate: float, current_price: Optional[float]):
+    """Compute aggregated position metrics for a ticker for a specific user."""
+    lots = await db.position_lots.find({"user_id": user_id, "ticker": ticker}, {"_id": 0}).sort("buy_date", 1).to_list(1000)
     if not lots:
         return None
 
@@ -616,7 +785,7 @@ async def _aggregate_position(ticker: str, mxn_rate: float, current_price: Optio
     avg_cost_usd = total_cost_usd / total_qty if total_qty else 0.0
     avg_cost_mxn = total_cost_mxn / total_qty if total_qty else 0.0
 
-    target_doc = await db.position_targets.find_one({"ticker": ticker}, {"_id": 0})
+    target_doc = await db.position_targets.find_one({"user_id": user_id, "ticker": ticker}, {"_id": 0})
     target_price = target_doc.get("target_price") if target_doc else None
     stop_loss_price = target_doc.get("stop_loss_price") if target_doc else None
 
@@ -660,12 +829,16 @@ async def _aggregate_position(ticker: str, mxn_rate: float, current_price: Optio
 
 
 @api_router.get("/portfolio")
-async def get_portfolio():
-    tickers = await db.position_lots.distinct("ticker")
-    if not tickers:
-        return {"positions": [], "totals": {"cost_usd": 0, "value_usd": 0, "pnl_usd": 0, "pnl_pct": 0, "cost_mxn": 0, "value_mxn": 0, "pnl_mxn": 0}, "mxn_rate": await get_usd_mxn_rate()}
-
+async def get_portfolio(request: Request, current_user: dict = Depends(get_current_user)):
+    scope = user_filter(current_user, request)
+    # We aggregate per (user_id, ticker) so admin in admin_all sees one row per user.
+    pipeline = [{"$match": scope}, {"$group": {"_id": {"user_id": "$user_id", "ticker": "$ticker"}}}]
+    pairs = await db.position_lots.aggregate(pipeline).to_list(10000)
     mxn_rate = await get_usd_mxn_rate()
+    if not pairs:
+        return {"positions": [], "totals": {"cost_usd": 0, "value_usd": 0, "pnl_usd": 0, "pnl_pct": 0, "cost_mxn": 0, "value_mxn": 0, "pnl_mxn": 0}, "mxn_rate": mxn_rate}
+
+    distinct_tickers = list({p["_id"]["ticker"] for p in pairs})
 
     async def fetch_price(t):
         try:
@@ -675,13 +848,16 @@ async def get_portfolio():
             logger.warning(f"portfolio price fetch {t}: {e}")
             return t, None
 
-    price_pairs = await asyncio.gather(*[fetch_price(t) for t in tickers])
+    price_pairs = await asyncio.gather(*[fetch_price(t) for t in distinct_tickers])
     prices = {t: p for t, p in price_pairs}
 
     positions = []
-    for t in tickers:
-        pos = await _aggregate_position(t, mxn_rate, prices.get(t))
+    for p in pairs:
+        uid = p["_id"]["user_id"]
+        t = p["_id"]["ticker"]
+        pos = await _aggregate_position(uid, t, mxn_rate, prices.get(t))
         if pos:
+            pos["user_id"] = uid
             positions.append(pos)
 
     cost_usd = sum(p["total_cost_usd"] for p in positions)
@@ -708,14 +884,15 @@ async def get_portfolio():
 
 
 @api_router.get("/portfolio/lots/{ticker}")
-async def get_lots(ticker: str):
+async def get_lots(ticker: str, request: Request, current_user: dict = Depends(get_current_user)):
     ticker = ticker.upper()
-    lots = await db.position_lots.find({"ticker": ticker}, {"_id": 0}).sort("buy_date", 1).to_list(1000)
+    scope = user_filter(current_user, request, {"ticker": ticker})
+    lots = await db.position_lots.find(scope, {"_id": 0}).sort("buy_date", 1).to_list(1000)
     return {"ticker": ticker, "lots": lots}
 
 
 @api_router.post("/portfolio/lots")
-async def add_lot(req: AddLotRequest):
+async def add_lot(req: AddLotRequest, current_user: dict = Depends(get_current_user)):
     ticker = req.ticker.strip().upper()
     if not ticker or not re.match(r"^[A-Z0-9.\-]{1,10}$", ticker):
         raise HTTPException(status_code=400, detail="Invalid ticker")
@@ -729,6 +906,7 @@ async def add_lot(req: AddLotRequest):
 
     doc = {
         "id": str(uuid.uuid4()),
+        "user_id": current_user["id"],
         "ticker": ticker,
         "qty": float(req.qty),
         "buy_price_usd": float(req.buy_price_usd),
@@ -741,15 +919,16 @@ async def add_lot(req: AddLotRequest):
 
 
 @api_router.delete("/portfolio/lots/{lot_id}")
-async def delete_lot(lot_id: str):
-    res = await db.position_lots.delete_one({"id": lot_id})
+async def delete_lot(lot_id: str, current_user: dict = Depends(get_current_user)):
+    q = {"id": lot_id} if is_admin(current_user) else {"id": lot_id, "user_id": current_user["id"]}
+    res = await db.position_lots.delete_one(q)
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Lot not found")
     return {"id": lot_id, "deleted": True}
 
 
 @api_router.put("/portfolio/target/{ticker}")
-async def set_target(ticker: str, req: SetTargetRequest):
+async def set_target(ticker: str, req: SetTargetRequest, current_user: dict = Depends(get_current_user)):
     ticker = ticker.upper()
     if req.target_price is None and req.stop_loss_price is None:
         raise HTTPException(status_code=400, detail="Provide target_price or stop_loss_price")
@@ -758,19 +937,20 @@ async def set_target(ticker: str, req: SetTargetRequest):
     if req.stop_loss_price is not None and req.stop_loss_price <= 0:
         raise HTTPException(status_code=400, detail="stop_loss_price must be > 0")
 
-    update = {"updated_at": datetime.now(timezone.utc).isoformat()}
+    update = {"user_id": current_user["id"], "updated_at": datetime.now(timezone.utc).isoformat()}
     if req.target_price is not None:
         update["target_price"] = float(req.target_price)
     if req.stop_loss_price is not None:
         update["stop_loss_price"] = float(req.stop_loss_price)
-    await db.position_targets.update_one({"ticker": ticker}, {"$set": update}, upsert=True)
+    await db.position_targets.update_one({"user_id": current_user["id"], "ticker": ticker}, {"$set": update}, upsert=True)
     return {"ticker": ticker, **update}
 
 
 @api_router.delete("/portfolio/target/{ticker}")
-async def delete_target(ticker: str):
+async def delete_target(ticker: str, current_user: dict = Depends(get_current_user)):
     ticker = ticker.upper()
-    res = await db.position_targets.delete_one({"ticker": ticker})
+    q = {"ticker": ticker} if is_admin(current_user) else {"user_id": current_user["id"], "ticker": ticker}
+    res = await db.position_targets.delete_one(q)
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Target not found")
     return {"ticker": ticker, "deleted": True}
@@ -778,7 +958,7 @@ async def delete_target(ticker: str):
 
 # ---------- Sell (close trade) ----------
 @api_router.post("/portfolio/sell")
-async def sell_position(req: SellRequest):
+async def sell_position(req: SellRequest, current_user: dict = Depends(get_current_user)):
     ticker = req.ticker.strip().upper()
     if req.qty <= 0:
         raise HTTPException(status_code=400, detail="qty must be > 0")
@@ -788,7 +968,7 @@ async def sell_position(req: SellRequest):
     if method not in ("FIFO", "LIFO", "SPECIFIC"):
         raise HTTPException(status_code=400, detail="method must be FIFO, LIFO or SPECIFIC")
 
-    lots = await db.position_lots.find({"ticker": ticker}, {"_id": 0}).to_list(1000)
+    lots = await db.position_lots.find({"user_id": current_user["id"], "ticker": ticker}, {"_id": 0}).to_list(1000)
     if not lots:
         raise HTTPException(status_code=404, detail=f"No lots for {ticker}")
 
@@ -893,6 +1073,7 @@ async def sell_position(req: SellRequest):
 
     trade_doc = {
         "id": str(uuid.uuid4()),
+        "user_id": current_user["id"],
         "ticker": ticker,
         "qty_sold": round(sold_qty, 6),
         "sell_price_usd": round(sell_price, 4),
@@ -916,8 +1097,9 @@ async def sell_position(req: SellRequest):
 
 
 @api_router.get("/portfolio/trades")
-async def list_trades(limit: int = 200):
-    trades = await db.closed_trades.find({}, {"_id": 0}).sort("sell_date", -1).to_list(limit)
+async def list_trades(request: Request, limit: int = 200, current_user: dict = Depends(get_current_user)):
+    scope = user_filter(current_user, request)
+    trades = await db.closed_trades.find(scope, {"_id": 0}).sort("sell_date", -1).to_list(limit)
     total_pnl_usd = sum(t.get("pnl_usd", 0) for t in trades)
     total_pnl_mxn = sum(t.get("pnl_mxn", 0) for t in trades)
     total_cost = sum(t.get("cost_usd", 0) for t in trades)
@@ -941,8 +1123,9 @@ async def list_trades(limit: int = 200):
 
 
 @api_router.get("/portfolio/trades/equity-curve")
-async def trades_equity_curve():
-    trades = await db.closed_trades.find({}, {"_id": 0}).sort("sell_date", 1).to_list(2000)
+async def trades_equity_curve(request: Request, current_user: dict = Depends(get_current_user)):
+    scope = user_filter(current_user, request)
+    trades = await db.closed_trades.find(scope, {"_id": 0}).sort("sell_date", 1).to_list(2000)
     monthly: dict = {}
     for t in trades:
         sd = t.get("sell_date") or ""
@@ -968,24 +1151,66 @@ async def trades_equity_curve():
 
 
 @api_router.delete("/portfolio/trades/{trade_id}")
-async def delete_trade(trade_id: str):
-    res = await db.closed_trades.delete_one({"id": trade_id})
+async def delete_trade(trade_id: str, current_user: dict = Depends(get_current_user)):
+    q = {"id": trade_id} if is_admin(current_user) else {"id": trade_id, "user_id": current_user["id"]}
+    res = await db.closed_trades.delete_one(q)
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Trade not found")
     return {"id": trade_id, "deleted": True}
 
 
+# ---------- Admin endpoints ----------
+@api_router.get("/admin/users")
+async def admin_list_users(admin: dict = Depends(require_admin)):
+    users = await db.users.find({}, {"_id": 0, "password_hash": 0}).sort("created_at", 1).to_list(10000)
+    enriched = []
+    for u in users:
+        uid = u["id"]
+        watchlist = await db.watchlist.count_documents({"user_id": uid})
+        lots = await db.position_lots.count_documents({"user_id": uid})
+        trades = await db.closed_trades.count_documents({"user_id": uid})
+        alerts = await db.alerts.count_documents({"user_id": uid})
+        unread = await db.alerts.count_documents({"user_id": uid, "read": False})
+        enriched.append({
+            **u,
+            "stats": {"watchlist": watchlist, "lots": lots, "trades": trades, "alerts": alerts, "unread_alerts": unread},
+        })
+    return {"users": enriched, "count": len(enriched)}
+
+
+@api_router.delete("/admin/users/{user_id}")
+async def admin_delete_user(user_id: str, admin: dict = Depends(require_admin)):
+    if user_id == admin["id"]:
+        raise HTTPException(status_code=400, detail="No puedes eliminarte a ti mismo")
+    user = await db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    # Cascade delete all user data
+    await db.watchlist.delete_many({"user_id": user_id})
+    await db.position_lots.delete_many({"user_id": user_id})
+    await db.position_targets.delete_many({"user_id": user_id})
+    await db.closed_trades.delete_many({"user_id": user_id})
+    await db.alerts.delete_many({"user_id": user_id})
+    await db.predictions.delete_many({"user_id": user_id})
+    await db.users.delete_one({"id": user_id})
+    return {"id": user_id, "deleted": True}
+
+
 async def _check_target_crosses() -> int:
-    """Emit alerts when current price crosses a target (up) or stop-loss (down)."""
-    targets = await db.position_targets.find({}, {"_id": 0}).to_list(500)
+    """Emit alerts per (user_id, ticker) when current price crosses target or stop-loss."""
+    targets = await db.position_targets.find({}, {"_id": 0}).to_list(5000)
     if not targets:
         return 0
     mxn_rate = await get_usd_mxn_rate()
     created = 0
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
     for tgt in targets:
         ticker = tgt["ticker"]
+        uid = tgt.get("user_id")
+        if not uid:
+            continue
         # only alert if user actually holds this ticker
-        has_lots = await db.position_lots.find_one({"ticker": ticker}, {"_id": 0})
+        has_lots = await db.position_lots.find_one({"user_id": uid, "ticker": ticker}, {"_id": 0})
         if not has_lots:
             continue
         try:
@@ -1000,29 +1225,35 @@ async def _check_target_crosses() -> int:
 
         target = tgt.get("target_price")
         sl = tgt.get("stop_loss_price")
-        last_target_alert = state.get("last_target_alert_at")
-        last_sl_alert = state.get("last_sl_alert_at")
-        now_iso = datetime.now(timezone.utc).isoformat()
-        recent_cutoff = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
 
-        if target and prev_price < target <= q.price and (not last_target_alert or last_target_alert < recent_cutoff):
-            await _create_alert(
-                ticker=ticker,
-                atype="target_hit",
-                message=f"{ticker} crossed target ${target:.2f} — current ${q.price:.2f}",
-                payload={"target_price": target, "current_price": q.price, "prev_price": prev_price},
+        if target and prev_price < target <= q.price:
+            recent_th = await db.alerts.find_one(
+                {"user_id": uid, "ticker": ticker, "type": "target_hit", "created_at": {"$gte": cutoff_iso}},
+                {"_id": 0},
             )
-            await db.ticker_state.update_one({"ticker": ticker}, {"$set": {"last_target_alert_at": now_iso}}, upsert=True)
-            created += 1
-        if sl and prev_price > sl >= q.price and (not last_sl_alert or last_sl_alert < recent_cutoff):
-            await _create_alert(
-                ticker=ticker,
-                atype="stop_loss_hit",
-                message=f"{ticker} hit stop-loss ${sl:.2f} — current ${q.price:.2f}",
-                payload={"stop_loss_price": sl, "current_price": q.price, "prev_price": prev_price},
+            if not recent_th:
+                await _create_alert(
+                    user_id=uid,
+                    ticker=ticker,
+                    atype="target_hit",
+                    message=f"{ticker} crossed target ${target:.2f} — current ${q.price:.2f}",
+                    payload={"target_price": target, "current_price": q.price, "prev_price": prev_price},
+                )
+                created += 1
+        if sl and prev_price > sl >= q.price:
+            recent_sl = await db.alerts.find_one(
+                {"user_id": uid, "ticker": ticker, "type": "stop_loss_hit", "created_at": {"$gte": cutoff_iso}},
+                {"_id": 0},
             )
-            await db.ticker_state.update_one({"ticker": ticker}, {"$set": {"last_sl_alert_at": now_iso}}, upsert=True)
-            created += 1
+            if not recent_sl:
+                await _create_alert(
+                    user_id=uid,
+                    ticker=ticker,
+                    atype="stop_loss_hit",
+                    message=f"{ticker} hit stop-loss ${sl:.2f} — current ${q.price:.2f}",
+                    payload={"stop_loss_price": sl, "current_price": q.price, "prev_price": prev_price},
+                )
+                created += 1
     return created
 
 
@@ -1045,9 +1276,30 @@ async def _alerts_loop():
 
 @app.on_event("startup")
 async def _on_startup():
+    await db.users.create_index("email", unique=True)
+    await db.login_attempts.create_index("identifier")
+    # Seed admin from env (idempotent — only inserts if missing)
+    admin_email = os.environ.get("ADMIN_EMAIL")
+    admin_password = os.environ.get("ADMIN_PASSWORD")
+    if admin_email and admin_password:
+        existing = await db.users.find_one({"email": admin_email.lower().strip()})
+        if not existing:
+            await db.users.insert_one({
+                "id": str(uuid.uuid4()),
+                "email": admin_email.lower().strip(),
+                "name": "Administrator",
+                "password_hash": hash_password(admin_password),
+                "role": "admin",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+            logger.info(f"Seeded admin user: {admin_email}")
+        elif existing.get("role") != "admin":
+            await db.users.update_one({"id": existing["id"]}, {"$set": {"role": "admin"}})
+            logger.info(f"Promoted existing user to admin: {admin_email}")
     asyncio.create_task(_alerts_loop())
 
 
+app.include_router(auth_router)
 app.include_router(api_router)
 
 app.add_middleware(
