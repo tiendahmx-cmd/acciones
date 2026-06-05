@@ -72,6 +72,15 @@ Web app with elegant dark UX/UI displaying real-time NASDAQ/NYSE quotes (INTC, S
 - **Migration**: limpieza one-shot de docs ownerless al startup (purgó 9 watchlist + 205 predictions del estado de desarrollo previo).
 - **36/36 tests pass** (iter 9 — corregidos 2 bugs encontrados durante el ciclo: crash KeyError en admin_all y regresión de aislamiento por overwrite de spread `{**scope, user_id: ...}`).
 
+### Iteration 10 (Hardening + CSV export + Module refactor)
+- **Admin password actualizado** a `KOsso8032#$+` (en `.env`; password sync on restart).
+- **Hardening auth**:
+  - `/api/auth/register` ahora tiene rate-limit por IP (10 registros/hora).
+  - `/api/auth/login` corre lockouts en paralelo: per-(IP, email) 5 fails / 15min Y per-email global 10 fails / 15min.
+- **CSV export**: nuevo `GET /api/portfolio/trades/export.csv` devuelve archivo `text/csv` listo para Excel/SAT con columnas: sell_date, ticker, method, qty_sold, sell_price_usd, sell_fx_rate, proceeds_usd, proceeds_mxn, cost_usd, cost_mxn, pnl_usd, pnl_mxn, return_pct, avg_days_held, annualized_return_pct, lots_consumed. Admin puede `?admin_all=true`. Frontend: botón "Exportar CSV" en el tab Historial.
+- **Refactor backend**: extraído auth (130 líneas → `auth_routes.py`) y admin (43 líneas → `admin_routes.py`) con dependencias compartidas en `deps.py`. `server.py` reducido de 1316 → 1196 líneas. Sin regresión.
+- **47/47 tests pass** (36 regression + 11 nuevos).
+
 ## Backlog (P1)
 - Sparkline chart on each card (recharts).
 - Push notifications when prediction direction flips.
